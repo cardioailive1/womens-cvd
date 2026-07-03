@@ -1,0 +1,37 @@
+# Render Blueprint — CardioAI Women's CVD Platform (unified single service)
+# Deploy: push this repo to GitHub, then Render → "New +" → "Blueprint" → select the repo.
+# One Node web service builds the React client AND runs the Express API that serves it,
+# plus a managed Postgres database.
+
+databases:
+  - name: cardioai-db
+    plan: basic-256mb          # bump to a paid tier for production PHI workloads
+    postgresMajorVersion: "16"
+    ipAllowList: []            # empty = only reachable from Render services
+
+services:
+  - type: web
+    name: cardioai
+    runtime: node
+    plan: starter
+    region: oregon
+    rootDir: .
+    buildCommand: npm ci && npm run build && npx prisma generate && npx prisma migrate deploy
+    startCommand: node dist/server/index.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cardioai-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true          # 256-bit random, stored encrypted by Render
+      - key: PHI_ENCRYPTION_KEY
+        generateValue: true          # AES-256-GCM field-encryption key (must be 32 bytes)
+      - key: SEED_ON_BOOT
+        value: "true"                # seeds synthetic demo data on first boot; set false after
