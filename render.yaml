@@ -16,7 +16,7 @@ services:
     plan: starter
     region: oregon
     rootDir: .
-    buildCommand: npm ci && npm run build && npx prisma generate && npx prisma migrate deploy
+    buildCommand: npm ci --include=dev && npx prisma generate && npm run build && npx prisma db push
     startCommand: node dist/server/index.js
     healthCheckPath: /api/health
     autoDeploy: true

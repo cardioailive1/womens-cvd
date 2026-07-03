@@ -81,7 +81,7 @@ node -e "console.log('JWT_SECRET=' + require('crypto').randomBytes(48).toString(
 node -e "console.log('PHI_ENCRYPTION_KEY=' + require('crypto').randomBytes(32).toString('base64'))"
 
 npm install
-npx prisma migrate dev --name init   # creates tables
+npx prisma db push                   # creates tables from the schema
 npm run seed                          # optional: synthetic demo data
 npm run dev                           # server :4000 + client :5173 together
 ```
@@ -123,7 +123,7 @@ npm start          # single server on :4000 serving API + client
 2. Render → **New + → Blueprint** → select the repo. `render.yaml` provisions:
    - `cardioai-db` — managed PostgreSQL 16
    - `cardioai` — one Node web service that builds the client, compiles the server, runs
-     `prisma migrate deploy`, and starts `node dist/server/index.js`. `JWT_SECRET` and
+     `prisma db push`, and starts `node dist/server/index.js`. `JWT_SECRET` and
      `PHI_ENCRYPTION_KEY` are auto-generated and stored encrypted.
 3. First boot seeds synthetic data (`SEED_ON_BOOT=true`). **Set it to `false`** afterward and rotate the
    demo passwords.
@@ -153,8 +153,16 @@ is forced to set their own password on first login (`mustChangePassword` → for
 documented at `src/server/auth/sso.ts`: any OIDC/SAML callback only has to resolve an app user and mint the
 same JWT, so enabling it later is additive.
 
-> **Schema note:** the account model includes a `mustChangePassword` column — run `npx prisma migrate dev`
-> locally (Render runs `prisma migrate deploy` on build).
+> **Schema / database sync.** The build uses `prisma db push` to make the database match
+> `schema.prisma` (no migration files are shipped, so this "just works" on a fresh Render database). It
+> fails safe: a future schema change that would drop data stops the deploy rather than destroying it. For a
+> real production system, adopt versioned migrations instead — run `npx prisma migrate dev --name init` to
+> start a migration history, commit `prisma/migrations/`, and switch the Render build to `prisma migrate
+> deploy`.
+
+> **Dev dependencies at build.** The Render build runs `npm ci --include=dev` because the build step needs
+> `typescript`, `vite`, and the `@types/*` packages. Without `--include=dev`, `NODE_ENV=production` prunes
+> them and the client type-check fails with missing-JSX-types errors.
 
 ---
 
