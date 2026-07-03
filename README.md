@@ -56,7 +56,8 @@ cardioai-cvd/
     │   └── seed.ts
     └── client/            # React SPA
         ├── main.tsx · App.tsx · api.ts · auth.tsx · styles.css
-        └── pages/         # Login, Dashboard, Patients, Assessment, Interop, Users, Account
+        └── pages/         # Login, Dashboard, Patients, Assessment, Diagnostics,
+                          #   Alerts, Reports, Interop, Users, Account
 ```
 
 **How the two halves connect:** in production `npm run build` compiles the server to `dist/server/` and the
@@ -137,10 +138,16 @@ npm start          # single server on :4000 serving API + client
 
 JWT-based (bcrypt hashing, short-lived tokens); access is role-gated by `requireRole(...)` middleware.
 
-**Account creation is admin-provisioned — no open self-registration.** An `ADMIN` creates accounts from the
-in-app **Users** page (or `POST /api/users`), assigns a role, and issues a temporary password. The new user
-is forced to set their own password on first login (`mustChangePassword` → forced screen →
-`POST /api/auth/change-password`).
+**Account creation — three paths:**
+
+1. **First-run bootstrap.** On a brand-new deployment with zero accounts, the login screen shows
+   "Create the first administrator." `POST /api/auth/bootstrap` works *only* while no users exist, so a
+   fresh deploy is never locked out; it self-disables the moment any account is created.
+2. **Open self-registration** (when `ALLOW_OPEN_SIGNUP=true`, the default in `render.yaml`). Anyone can
+   create an account from the login screen. New users get the least-privilege **READONLY** role; an admin
+   elevates them from the Users page. Set `ALLOW_OPEN_SIGNUP=false` to require admin provisioning only.
+3. **Admin provisioning.** An `ADMIN` creates accounts from the in-app **Users** page (or `POST /api/users`),
+   assigns a role, and issues a temporary password the user must change on first login.
 
 | Role | Can do |
 |------|--------|
@@ -170,6 +177,9 @@ same JWT, so enabling it later is additive.
 
 | Method | Path | Notes |
 |--------|------|-------|
+| `GET` | `/api/auth/config` | Public — tells the UI if bootstrap/open-signup are available |
+| `POST` | `/api/auth/bootstrap` | Creates first ADMIN; works only while 0 users exist |
+| `POST` | `/api/auth/register` | Open self-signup (READONLY); when `ALLOW_OPEN_SIGNUP=true` |
 | `POST` | `/api/auth/login` | Returns JWT; rate-limited; audited |
 | `POST` | `/api/auth/change-password` | Self-service; rotates admin-issued temp passwords |
 | `GET` | `/api/users` | **ADMIN** — list accounts (no hashes) |
@@ -186,6 +196,8 @@ same JWT, so enabling it later is additive.
 | `POST` | `/api/hl7/ingest` | Parses ADT/ORU (text/plain), upserts, returns HL7 ACK |
 | `POST` | `/api/hl7/parse` | Structured parse preview (no persistence) |
 | `GET` | `/api/audit` | Append-only audit trail (ADMIN only) |
+| `GET` | `/api/alerts` | Live clinical alerts derived from patient risk levels |
+| `GET` | `/api/reports/summary?days=30` | Stats + diagnosis distribution from assessment records |
 | `GET` | `/api/health` | Liveness/readiness (DB probe) |
 
 ---
