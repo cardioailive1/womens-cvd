@@ -1,0 +1,147 @@
+// CardioAI — data model
+// PHI-bearing string fields are stored AES-256-GCM encrypted at the application layer
+// (see src/lib/security.ts). Column names ending in "Enc" hold ciphertext.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  PHYSICIAN
+  NURSE
+  READONLY
+}
+
+enum RiskLevel {
+  LOW
+  MODERATE
+  HIGH
+  CRITICAL
+}
+
+enum Sex {
+  FEMALE
+  MALE
+  OTHER
+  UNKNOWN
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         Role     @default(READONLY)
+  specialty    String?
+  active       Boolean  @default(true)
+  mustChangePassword Boolean @default(false)  // admin-provisioned temp passwords must be rotated
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  assessments  Assessment[]
+  auditLogs    AuditLog[]
+}
+
+model Patient {
+  id            String    @id @default(cuid())
+  mrn           String    @unique          // medical record number
+  // PHI (encrypted at rest)
+  firstNameEnc  String
+  lastNameEnc   String
+  birthDateEnc  String
+  phoneEnc      String?
+  emailEnc      String?
+  sex           Sex       @default(FEMALE)
+
+  // Clinical/demographic flags used by the risk engine (non-identifying)
+  pregnant          Boolean  @default(false)
+  gestationalWeeks  Int?
+  postpartumMonths  Int?
+  preeclampsiaHx    Boolean  @default(false)
+  gestationalHtnHx  Boolean  @default(false)
+  gestationalDmHx   Boolean  @default(false)
+  hellpHx           Boolean  @default(false)
+  hypertension      Boolean  @default(false)
+  diabetes          Boolean  @default(false)
+  hyperlipidemia    Boolean  @default(false)
+  smoker            Boolean  @default(false)
+  familyHxEarlyCvd  Boolean  @default(false)
+  pcos              Boolean  @default(false)
+  autoimmune        Boolean  @default(false)
+  migraineWithAura  Boolean  @default(false)
+  fmd               Boolean  @default(false)
+
+  riskLevel     RiskLevel @default(LOW)
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  observations  Observation[]
+  assessments   Assessment[]
+
+  @@index([riskLevel])
+}
+
+// FHIR Observation-aligned vitals & labs
+model Observation {
+  id         String   @id @default(cuid())
+  patient    Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  patientId  String
+  loincCode  String                 // e.g. 8480-6 systolic BP
+  display    String
+  value      Float
+  unit       String
+  effectiveAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  @@index([patientId, loincCode])
+}
+
+model Assessment {
+  id             String    @id @default(cuid())
+  patient        Patient   @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  patientId      String
+  clinician      User?     @relation(fields: [clinicianId], references: [id])
+  clinicianId    String?
+
+  primaryDx      String
+  confidence     Float
+  riskScore      Int
+  riskLevel      RiskLevel
+  automationTier String                 // "TIER_1" | "TIER_2" | "TIER_3"
+  differentials  Json                    // [{ label, probability }]
+  factors        Json                    // { critical:[], moderate:[], protective:[] }
+  prognosis      Json                    // { oneYear, fiveYear, tenYear, lifetime }
+  recommendations Json                   // string[]
+  physicianNote  String?
+  status         String    @default("DRAFT") // DRAFT | CONFIRMED
+  createdAt      DateTime  @default(now())
+
+  @@index([patientId])
+}
+
+// Append-only audit trail (HIPAA §164.312(b) / SOC 2 CC7). Never updated or deleted.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actor      User?    @relation(fields: [actorId], references: [id])
+  actorId    String?
+  actorEmail String?
+  action     String                 // e.g. PATIENT_READ, ASSESSMENT_CREATE, LOGIN
+  resource   String                 // e.g. Patient/abc123
+  ip         String?
+  userAgent  String?
+  outcome    String   @default("SUCCESS") // SUCCESS | DENIED | ERROR
+  meta       Json?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId])
+  @@index([resource])
+  @@index([createdAt])
+}
