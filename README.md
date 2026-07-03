@@ -5,14 +5,6 @@ women-specific cardiovascular disease (preeclampsia/PPCM, SCAD, Takotsubo, coron
 FMD). One Express server exposes a **FHIR R4** + **HL7 v2** API *and* serves the compiled **React** client,
 with the technical controls that support HIPAA / SOC 2 / FDA-SaMD / ISO programs.
 
-> ⚠️ **Read this first.** This is a demonstration/reference platform. The risk engine is a *transparent,
-> rules-based* scaffold — **not** a validated diagnostic model and **not** an FDA-cleared device. All demo
-> data is synthetic. Software alone is never "HIPAA compliant," "SOC 2 certified," or "FDA approved" — those
-> are organizational programs. See [`COMPLIANCE.md`](./COMPLIANCE.md) for what's implemented in code versus
-> what remains your organization's responsibility.
-
----
-
 ## Stack
 
 | Layer | Technology |
