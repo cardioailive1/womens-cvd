@@ -36,8 +36,8 @@ assessmentRouter.post('/run', requireRole('ADMIN', 'PHYSICIAN', 'NURSE'), async 
         patientId: p.id, clinicianId: req.user!.id,
         primaryDx: result.primaryDx, confidence: result.confidence,
         riskScore: result.riskScore, riskLevel: result.riskLevel, automationTier: result.automationTier,
-        differentials: result.differentials, factors: result.factors,
-        prognosis: result.prognosis, recommendations: result.recommendations,
+        differentials: result.differentials as any, factors: result.factors as any,
+        prognosis: result.prognosis as any, recommendations: result.recommendations as any,
       },
     });
     await prisma.patient.update({ where: { id: p.id }, data: { riskLevel: result.riskLevel } });

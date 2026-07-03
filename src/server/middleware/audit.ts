@@ -23,7 +23,9 @@ export async function audit(
         outcome,
         ip: (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || null,
         userAgent: req.headers['user-agent'] || null,
-        meta: meta ?? undefined,
+        // Cast at this JSON boundary — meta holds plain JSON-serialisable values.
+        // `any` keeps this stable whether Prisma's client is the generated build or the stub.
+        meta: (meta ?? undefined) as any,
       },
     });
   } catch (err) {
