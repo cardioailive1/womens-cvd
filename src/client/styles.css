@@ -102,3 +102,35 @@ pre.code { background: #0f2438; color: #cfe6f7; padding: 1rem; border-radius: 10
 @keyframes spin { to { transform: rotate(360deg); } }
 .meter { height: 12px; background: var(--border); border-radius: 999px; overflow: hidden; }
 .meter > span { display: block; height: 100%; background: linear-gradient(90deg, var(--success), var(--warning), var(--danger)); }
+
+/* ---- Diagnostics Guide / Alerts / Reports (ported from original design) ---- */
+.section-alert { padding: 1rem; border-radius: 6px; margin-bottom: 1rem; border-left: 4px solid; }
+.section-alert.danger { background: #fff5f5; border-left-color: var(--danger); color: var(--danger); }
+.section-alert.warning { background: #fffbf0; border-left-color: var(--warning); color: #8a5a00; }
+.section-alert.success { background: #f0fff4; border-left-color: var(--success); color: var(--success); }
+.section-alert.info { background: #f0faff; border-left-color: var(--info); color: #055160; }
+
+.pillbadge { display: inline-block; padding: .3rem .65rem; border-radius: 999px; font-size: .75rem; font-weight: 600; border: 1px solid; margin-right: .35rem; }
+.pillbadge.danger { background: #fff5f5; color: var(--danger); border-color: var(--danger); }
+.pillbadge.warning { background: #fffbf0; color: #8a5a00; border-color: var(--warning); }
+.pillbadge.info { background: #f0faff; color: #055160; border-color: var(--info); }
+.pillbadge.primary { background: #eef6fc; color: var(--primary-dark); border-color: var(--primary); }
+.pillbadge.success { background: #f0fff4; color: var(--success); border-color: var(--success); }
+
+.diag-card { background: var(--surface); border: 1px solid var(--border); border-left-width: 4px; border-radius: var(--radius); box-shadow: var(--shadow); padding: 1.25rem; margin-bottom: 1.25rem; transition: box-shadow .2s; }
+.diag-card:hover { box-shadow: 0 4px 16px rgba(27,79,114,.14); }
+.diag-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+.diag-head h3 { color: var(--primary-dark); margin-bottom: .5rem; font-size: 1.15rem; }
+.diag-body { margin-top: 1rem; }
+.diag-body h4 { color: var(--primary-dark); margin: 1.25rem 0 .5rem; font-size: 1rem; }
+.diag-body ul, .diag-body ol { margin-left: 1.4rem; line-height: 1.9; }
+.diag-note { padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
+
+.quicknav { background: #eef6fc; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
+.quicknav .btn { margin: .2rem; }
+
+.chart-bars { display: flex; align-items: flex-end; height: 260px; gap: 1rem; padding: 1.5rem 0 0; }
+.chart-bars .bar { flex: 1; background: linear-gradient(180deg, var(--primary), var(--primary-dark)); border-radius: 6px 6px 0 0; position: relative; transition: opacity .2s; min-height: 4px; }
+.chart-bars .bar:hover { opacity: .82; }
+.chart-bars .bar .val { position: absolute; top: -22px; left: 50%; transform: translateX(-50%); font-size: .8rem; font-weight: 600; color: var(--primary-dark); }
+.chart-bars .bar .lbl { position: absolute; bottom: -26px; left: 50%; transform: translateX(-50%); font-size: .8rem; white-space: nowrap; color: var(--muted); }

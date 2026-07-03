@@ -24,6 +24,17 @@ export interface AssessmentResult {
   recommendations: string[]; createdAt: string;
 }
 
+export interface AlertDto {
+  id: string; severity: 'CRITICAL' | 'HIGH' | 'INFO'; patient: string; mrn: string;
+  message: string; when: string; action: 'Acknowledge' | 'Review' | 'Schedule' | 'View';
+}
+export interface ReportSummary {
+  period: { days: number; since: string };
+  stats: { totalAssessments: number; highRiskIdentified: number; criticalCount: number; confirmedCount: number; totalPatients: number };
+  riskLevelBreakdown: Record<string, number>;
+  distribution: { label: string; count: number }[];
+}
+
 let token: string | null = sessionStorage.getItem('cardioai_token');
 export function setToken(t: string | null) {
   token = t;
@@ -45,8 +56,13 @@ async function req<T>(path: string, opts: RequestInit = {}, raw = false): Promis
 }
 
 export const api = {
+  authConfig: () => req<{ needsBootstrap: boolean; openSignup: boolean }>('/api/auth/config'),
   login: (email: string, password: string) =>
     req<{ token: string; user: User }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
+  bootstrap: (email: string, fullName: string, password: string) =>
+    req<{ token: string; user: User }>('/api/auth/bootstrap', { method: 'POST', body: JSON.stringify({ email, fullName, password }) }),
+  register: (email: string, fullName: string, password: string) =>
+    req<{ token: string; user: User }>('/api/auth/register', { method: 'POST', body: JSON.stringify({ email, fullName, password }) }),
   me: () => req<{ user: User }>('/api/auth/me'),
   patients: () => req<{ patients: Patient[] }>('/api/patients'),
   patient: (id: string) => req<{ patient: Patient }>(`/api/patients/${id}`),
@@ -59,6 +75,8 @@ export const api = {
   fhirEverything: (id: string) => req<unknown>(`/api/fhir/Patient/${id}/$everything`),
   hl7Parse: (message: string) => req<unknown>('/api/hl7/parse', { method: 'POST', body: message, headers: { 'Content-Type': 'text/plain' } }, true),
   auditLogs: () => req<{ logs: any[] }>('/api/audit'),
+  alerts: () => req<{ alerts: AlertDto[]; counts: Record<string, number> }>('/api/alerts'),
+  reportSummary: (days = 30) => req<ReportSummary>(`/api/reports/summary?days=${days}`),
   // Self-service
   changePassword: (currentPassword: string, newPassword: string) =>
     req<{ ok: true }>('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ currentPassword, newPassword }) }),

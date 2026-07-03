@@ -5,6 +5,9 @@ import Dashboard from './pages/Dashboard';
 import Patients from './pages/Patients';
 import Assessment from './pages/Assessment';
 import Interop from './pages/Interop';
+import Diagnostics from './pages/Diagnostics';
+import Alerts from './pages/Alerts';
+import Reports from './pages/Reports';
 import Users from './pages/Users';
 import Account from './pages/Account';
 
@@ -32,6 +35,9 @@ function Shell() {
           <NavLink to="/" end>📊 Dashboard</NavLink>
           <NavLink to="/patients">👥 Patients</NavLink>
           <NavLink to="/assessment">🔬 Risk Assessment</NavLink>
+          <NavLink to="/diagnostics">🫀 Diagnostics Guide</NavLink>
+          <NavLink to="/alerts">🚨 Alerts</NavLink>
+          <NavLink to="/reports">📋 Reports</NavLink>
           <NavLink to="/interop">🔗 FHIR / HL7</NavLink>
           {user?.role === 'ADMIN' && <NavLink to="/users">🛡️ Users</NavLink>}
           <NavLink to="/account">⚙️ Account</NavLink>
@@ -46,6 +52,9 @@ function Shell() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/patients" element={<Patients />} />
           <Route path="/assessment" element={<Assessment />} />
+          <Route path="/diagnostics" element={<Diagnostics />} />
+          <Route path="/alerts" element={<Alerts />} />
+          <Route path="/reports" element={<Reports />} />
           <Route path="/interop" element={<Interop />} />
           {user?.role === 'ADMIN' && <Route path="/users" element={<Users />} />}
           <Route path="/account" element={<Account />} />

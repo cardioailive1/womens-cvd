@@ -13,6 +13,8 @@ import { userRouter } from './routes/user.routes.js';
 import { patientRouter } from './routes/patient.routes.js';
 import { assessmentRouter } from './routes/assessment.routes.js';
 import { interopRouter } from './routes/interop.routes.js';
+import { alertsRouter } from './routes/alerts.routes.js';
+import { reportsRouter } from './routes/reports.routes.js';
 import { healthRouter, auditRouter } from './routes/health.routes.js';
 import { runSeed } from './seed.js';
 
@@ -48,6 +50,8 @@ app.use('/api/users', userRouter);
 app.use('/api/patients', patientRouter);
 app.use('/api/assessments', assessmentRouter);
 app.use('/api', interopRouter);          // exposes /api/fhir/* and /api/hl7/*
+app.use('/api/alerts', alertsRouter);
+app.use('/api/reports', reportsRouter);
 app.use('/api/audit', auditRouter);
 
 // --- Serve the built React client (single-service deploy) ---

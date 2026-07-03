@@ -15,6 +15,12 @@ const schema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+  // When true, anyone may self-register (as READONLY). First-run admin bootstrap
+  // is always available while zero users exist, regardless of this flag.
+  ALLOW_OPEN_SIGNUP: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 const parsed = schema.safeParse(process.env);
