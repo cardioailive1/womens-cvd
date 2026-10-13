@@ -66,9 +66,16 @@ def main(argv=None):
     ap.add_argument("--warmup", type=int, default=500); ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--no-imaging", action="store_true", help="skip ECG/echo loading (EHR-only ablation)")
     ap.add_argument("--n-boot", type=int, default=1000)
+    ap.add_argument("--report-dir", help="where reports 10-12 go (default: privacy.report_dir); "
+                                         "use one folder per run so runs do not overwrite each other")
+    ap.add_argument("--site-adv-weight", type=float, default=0.1,
+                    help="lambda_site_adv; 0 turns the site adversary off (fewer than 2 usable sites)")
+    ap.add_argument("--fair-weight", type=float, default=0.3, help="lambda_fair (form: 0.3)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     cfg = StudyConfig.load(a.config)
+    if a.report_dir:
+        cfg.report_dir = a.report_dir
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
@@ -113,7 +120,7 @@ def main(argv=None):
                                               0.5 * (1 + math.cos(math.pi * min(s / total_steps, 1.0))))
     use_amp = dev == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    w = LossWeights()
+    w = LossWeights(site_adv=a.site_adv_weight, fair=a.fair_weight)
     best, bad, step, history = -1.0, 0, 0, []
 
     for epoch in range(a.epochs):

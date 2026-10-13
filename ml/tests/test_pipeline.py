@@ -180,6 +180,7 @@ def test_train_export_serve(study, tmp_path):
     best = train.main(["--config", str(cfg_path), "--study-dir", str(study["tmp"] / "tables"),
                        "--out", str(run), "--size", "small", "--epochs", "3", "--batch-size", "16",
                        "--warmup", "10", "--workers", "0", "--n-boot", "50",
+                       "--report-dir", str(tmp_path / "reports"), "--site-adv-weight", "0.1",
                        "--init-weights", str(pre_dir / "encoders.pt"),
                        "--preprocessors", str(pre_dir / "preprocessors.pkl")])
     assert best >= 0
