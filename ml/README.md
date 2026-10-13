@@ -2,8 +2,10 @@
 
 Code for training **HCMAN** (Hierarchical Cross-Modal Attention Network, Cardio AI) on de-identified
 Mayo Clinic Platform (MCP) data, and for serving it to the CardioAI app in this repository
-(`src/server/services/hcmanAdapter.ts`). The study protocol is the
-companion document; this README is the run book.
+(`src/server/services/hcmanAdapter.ts`).
+
+**Training on MCP? Follow [RUNBOOK.md](RUNBOOK.md)** — the step-by-step guide with commands,
+go / no-go gates, troubleshooting and a run checklist. This README is the short overview.
 
 ```
 config/study.yaml        every study parameter (windows, thresholds, sources, splits)
