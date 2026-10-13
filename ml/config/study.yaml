@@ -1,0 +1,76 @@
+# HCMAN Women's CVD cohort study — run configuration for Mayo Clinic Platform (MCP).
+# Every value here is read by mcp_adapter.config.StudyConfig. Change values, not code.
+
+platform:
+  dialect: spark                 # spark (MCP workbench) | duckdb (local synthetic tests)
+  cdm_schema: omop_cdm           # OMOP CDM schema name — confirm in MCP Schema Visualizer
+  vocab_schema: omop_cdm         # where CONCEPT / CONCEPT_ANCESTOR live (often same schema)
+  results_schema: hcman_results  # writable scratch schema for cohort tables, if MCP grants one
+  # Imaging is CONFIRMED available under the Cardio AI MCP contract and is REQUIRED for this
+  # study (imaging_required: true). Fill in where MCP exposes it — ask the MCP mentor for the
+  # table or bucket names; the rest of the pipeline does not change.
+  imaging_required: true
+  ecg_source:
+    kind: muse_xml_dir           # muse_xml_dir | dicom_ecg | npy_dir
+    path: null                   # TODO(MCP): root folder of ECG files (manifest paths are relative to it)
+    manifest: null               # TODO(MCP): "sql:<schema.table>" or a .csv/.parquet with
+                                 #   person_id, record_date, path
+  echo_source:
+    kind: dicom_dir              # dicom_dir | npy_dir
+    path: null                   # TODO(MCP): root folder of echo DICOM cine files
+    manifest: null               # TODO(MCP): "sql:<schema.table>" or file with
+                                 #   person_id, record_date, view (PLAX|PSAX|A4C|A2C), path,
+                                 #   optional ed_frame, es_frame
+
+study:
+  study_start: "2010-01-01"      # de-identified dates are shifted uniformly; windows use relative days only
+  study_end: "2025-12-31"
+  min_age: 18
+  max_age_pregnancy_strata: 55
+  lookback_days: 365             # inputs come from [index - lookback, index]
+  ecg_echo_window_days: [-30, 2] # nearest ECG / echo to index within this window
+  labs_window_days: 90           # stream 5 serial-lab window, ending at index
+  label_window_days: 90          # condition labels confirmed within (index, index + 90]
+  outcome_window_days: 365       # MACE / postpartum CVD outcomes within (index + blanking, index + 365]
+  outcome_blanking_days: 7       # events in days 1-7 belong to the index episode, not future MACE
+  min_prior_observation_days: 365
+  postpartum_max_days: 182       # "postpartum < 6 months"
+  condition_label_rule: two_codes_or_inpatient   # two_codes_or_inpatient | any_code
+
+sampling:
+  # Minimum targets from the Model Details Form; the feasibility query decides real N.
+  stratum_targets:
+    A_pregnant_high_risk: 200
+    B_postpartum: 200
+    C_scad_fmd: 200
+    D_postmeno_takotsubo_cmd: 250
+    E_pcos_endo_autoimmune: 200
+    F_prior_preeclampsia: 150
+  take_all_available: true       # use every eligible woman, not just the targets
+  max_per_stratum: null          # cap (e.g. 5000) to bound compute; null = no cap
+
+splits:
+  scheme: site_and_time          # site_and_time | random_patient
+  test_fraction: 0.15
+  val_fraction: 0.15
+  temporal_holdout_after_day: null   # optional: index days (shifted) after this go to a temporal test set
+  seed: 20261013
+
+privacy:
+  min_cell_size: 11              # suppress any reported count below this (MCP sets the official threshold)
+  report_dir: reports            # aggregate-only outputs, safe to request for export
+
+model:
+  condition_head: multilabel     # multilabel (sigmoid, recommended) | softmax (as in the form)
+  size: full                     # full (form spec) | small (smoke tests)
+  freeze_imaging_backbones_epochs: 5
+
+pretraining:
+  # First-time training: there are no prior weights or Phase 1 data, so every encoder is
+  # pre-trained from scratch inside MCP on women OUTSIDE the cohort's validation/test splits.
+  max_women: 200000              # cap on the pool of women with cardiac evaluations
+  ecg_epochs: 30                 # SimCLR on 12-lead ECGs
+  echo_epochs: 30                # SimCLR on echo frames
+  ehr_epochs: 20                 # masked-token modelling (15% masking)
+  labs_epochs: 20                # masked-step value prediction
+  batch_size: 256

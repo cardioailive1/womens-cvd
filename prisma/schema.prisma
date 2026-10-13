@@ -78,6 +78,14 @@ model Patient {
   migraineWithAura  Boolean  @default(false)
   fmd               Boolean  @default(false)
 
+  // HCMAN stream-4 inputs not captured above (additive; existing rows stay valid)
+  menopausalStatus          String?   // pre | peri | post | surgical
+  ageAtMenopause            Int?
+  endometriosis             Boolean  @default(false)
+  parity                    Int?
+  breastCancerCardiotoxicTx Boolean  @default(false)  // breast cancer + anthracycline / HER2 therapy
+  recentEmotionalStressor   Boolean  @default(false)  // within 30 days (Takotsubo trigger)
+
   riskLevel     RiskLevel @default(LOW)
   active        Boolean   @default(true)
   createdAt     DateTime  @default(now())
@@ -122,6 +130,8 @@ model Assessment {
   recommendations Json                   // string[]
   physicianNote  String?
   status         String    @default("DRAFT") // DRAFT | CONFIRMED
+  engine         String    @default("rules") // rules | hcman
+  modelVersion   String?                     // HCMAN model version when engine = hcman
   createdAt      DateTime  @default(now())
 
   @@index([patientId])

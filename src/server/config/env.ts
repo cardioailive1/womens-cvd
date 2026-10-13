@@ -21,6 +21,11 @@ const schema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+  // Risk engine: 'rules' (transparent scaffold, default) or 'hcman' (model trained on Mayo
+  // Clinic Platform, served by hcman/serve.py). 'hcman' falls back to 'rules' on any error.
+  ASSESSMENT_ENGINE: z.enum(['rules', 'hcman']).default('rules'),
+  HCMAN_INFERENCE_URL: z.string().url().optional(),
+  HCMAN_TIMEOUT_MS: z.coerce.number().default(8000),
 });
 
 const parsed = schema.safeParse(process.env);
