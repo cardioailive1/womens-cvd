@@ -37,3 +37,5 @@ services:
         value: "true"                # seeds synthetic demo data on first boot; set false after
       - key: ALLOW_OPEN_SIGNUP
         value: "true"                # allow public self-registration (new users = READONLY)
+      - key: ASSESSMENT_ENGINE
+        value: rules                 # set to "hcman" + HCMAN_INFERENCE_URL once the model is exported

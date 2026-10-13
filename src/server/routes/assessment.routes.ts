@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
 import { requireAuth, requireRole, type AuthedRequest } from '../middleware/auth.js';
 import { audit } from '../middleware/audit.js';
-import { assessRisk } from '../services/riskEngine.js';
+import type { RiskInput } from '../services/riskEngine.js';
+import { runAssessment } from '../services/hcmanAdapter.js';
 
 export const assessmentRouter = Router();
 assessmentRouter.use(requireAuth);
@@ -15,21 +16,26 @@ const runSchema = z.object({
   bmi: z.number().optional(),
 });
 
-// Run the (transparent, rules-based) risk assessment for a patient.
+// Run the risk assessment for a patient: the rules engine by default, or HCMAN when
+// ASSESSMENT_ENGINE=hcman (falls back to rules if the model service is unavailable).
 assessmentRouter.post('/run', requireRole('ADMIN', 'PHYSICIAN', 'NURSE'), async (req: AuthedRequest, res, next) => {
   try {
     const body = runSchema.parse(req.body);
-    const p = await prisma.patient.findUnique({ where: { id: body.patientId } });
+    const p = await prisma.patient.findUnique({
+      where: { id: body.patientId },
+      include: { observations: { orderBy: { effectiveAt: 'desc' }, take: 200 } },
+    });
     if (!p) return res.status(404).json({ error: 'Patient not found' });
 
-    const result = assessRisk({
+    const rulesInput: RiskInput = {
       age: body.age, systolicBp: body.systolicBp, bmi: body.bmi,
       pregnant: p.pregnant, gestationalWeeks: p.gestationalWeeks, postpartumMonths: p.postpartumMonths,
       preeclampsiaHx: p.preeclampsiaHx, gestationalHtnHx: p.gestationalHtnHx, gestationalDmHx: p.gestationalDmHx,
       hellpHx: p.hellpHx, hypertension: p.hypertension, diabetes: p.diabetes, hyperlipidemia: p.hyperlipidemia,
       smoker: p.smoker, familyHxEarlyCvd: p.familyHxEarlyCvd, pcos: p.pcos, autoimmune: p.autoimmune,
       migraineWithAura: p.migraineWithAura, fmd: p.fmd,
-    });
+    };
+    const { result, engine, modelVersion, fallbackReason } = await runAssessment(rulesInput, p, p.observations);
 
     const assessment = await prisma.assessment.create({
       data: {
@@ -38,12 +44,14 @@ assessmentRouter.post('/run', requireRole('ADMIN', 'PHYSICIAN', 'NURSE'), async 
         riskScore: result.riskScore, riskLevel: result.riskLevel, automationTier: result.automationTier,
         differentials: result.differentials as any, factors: result.factors as any,
         prognosis: result.prognosis as any, recommendations: result.recommendations as any,
+        engine, modelVersion,
       },
     });
     await prisma.patient.update({ where: { id: p.id }, data: { riskLevel: result.riskLevel } });
-    await audit(req, 'ASSESSMENT_CREATE', `Assessment/${assessment.id}`, 'SUCCESS', { riskLevel: result.riskLevel });
+    await audit(req, 'ASSESSMENT_CREATE', `Assessment/${assessment.id}`, 'SUCCESS',
+      { riskLevel: result.riskLevel, engine, modelVersion, fallbackReason });
 
-    res.status(201).json({ assessment: { id: assessment.id, ...result, createdAt: assessment.createdAt } });
+    res.status(201).json({ assessment: { id: assessment.id, ...result, engine, modelVersion, createdAt: assessment.createdAt } });
   } catch (err) { next(err); }
 });
 
