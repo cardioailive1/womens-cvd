@@ -194,6 +194,17 @@ same JWT, so enabling it later is additive.
 
 ---
 
+## HCMAN model (ml/)
+
+`ml/` holds the training study for **HCMAN**, the multimodal women's CVD model, trained on
+de-identified Mayo Clinic Platform data (OMOP EHR, 12-lead ECG, echocardiography). It is a
+first-time training: encoders are pre-trained from scratch inside the platform, then fine-tuned
+on a six-stratum women's cohort. See `ml/README.md` for the run order.
+
+The app uses the model only when `ASSESSMENT_ENGINE=hcman` and `HCMAN_INFERENCE_URL` point at
+the inference service (`ml/hcman/serve.py`); otherwise, or if the service fails, it uses the
+rules engine below. Every assessment records which engine and model version produced it.
+
 ## The risk engine (please read)
 
 `src/server/services/riskEngine.ts` is **deterministic and fully explainable** — every point in a score maps
