@@ -30,6 +30,8 @@ def run_feasibility(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
     counts = Q.feasibility_counts(be, cfg).sort_values("grp")
     rep = suppress(counts, ["n_women"], cfg.min_cell_size)
     write_report(rep, "01_feasibility_counts", cfg.report_dir)
+    labs = Q.lab_code_coverage(be, cfg)
+    write_report(suppress(labs, ["n_rows", "n_women"], cfg.min_cell_size), "01b_lab_code_coverage", cfg.report_dir)
     return counts
 
 
