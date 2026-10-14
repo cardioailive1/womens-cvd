@@ -10,3 +10,5 @@ onnx>=1.16
 onnxruntime>=1.18      # inference service
 duckdb>=1.0            # local tests only (MCP uses Spark)
 pytest>=8
+ipywidgets>=8.0      # in-workspace review tool (annotate.review_ui)
+pillow>=10.0         # frame rendering for the review tool

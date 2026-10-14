@@ -100,7 +100,8 @@ def build_study(be: Backend, cfg: StudyConfig, out_dir: str | Path) -> dict[str,
     ecg_sel, echo_sel = _imaging_selection(be, cfg, cohort)
 
     tables = {"cohort": cohort, "labels": labels, "repro": repro, "measurements": meas,
-              "ehr_tokens": tokens, "ecg_records": ecg_sel, "echo_records": echo_sel}
+              "ehr_tokens": tokens, "ecg_records": ecg_sel, "echo_records": echo_sel,
+              "code_events": ev}            # used by annotate.phenotype for chart review sampling
     for name, df in tables.items():
         df.to_pickle(out / f"{name}.pkl")
 
