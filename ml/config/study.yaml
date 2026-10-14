@@ -37,6 +37,21 @@ study:
   postpartum_max_days: 182       # "postpartum < 6 months"
   condition_label_rule: two_codes_or_inpatient   # two_codes_or_inpatient | any_code
 
+reports:
+  # Free-text clinical reports for chart review (runbook Step 4b). These are Mayo-native tables,
+  # outside OMOP (per MCP, 14 Oct 2026). Fill the TODO(MCP) columns after the MCP data training;
+  # person_column must hold the same patient key as OMOP person_id, or the source is skipped.
+  echo_notes:
+    table: FACT_ECHO_TEST          # TODO(MCP): add the schema prefix if needed
+    text_column: ECHO_NOTE         # MCP: "Echo Notes are in FACT_ECHO_TEST.ECHO_NOTE"
+    person_column: null            # TODO(MCP)
+    date_column: null              # TODO(MCP)
+  radiology:
+    table: FACT_RADIOLOGY          # TODO(MCP): add the schema prefix if needed
+    text_column: null              # TODO(MCP): report text column
+    person_column: null            # TODO(MCP)
+    date_column: null              # TODO(MCP)
+
 sampling:
   # Minimum targets from the Model Details Form; the feasibility query decides real N.
   stratum_targets:
@@ -73,4 +88,5 @@ pretraining:
   echo_epochs: 30                # SimCLR on echo frames
   ehr_epochs: 20                 # masked-token modelling (15% masking)
   labs_epochs: 20                # masked-step value prediction
-  batch_size: 256
+  batch_size: 64                 # sized for the shared A100 40 GB machines; confirm with the
+                                 # 1-epoch timing run (runbook Step 5) and lower if memory runs out

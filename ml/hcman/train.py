@@ -63,6 +63,9 @@ def main(argv=None):
     ap.add_argument("--preprocessors", help="preprocessors.pkl from hcman.pretrain (required with --init-weights)")
     ap.add_argument("--size", choices=["full", "small"]); ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=32); ap.add_argument("--patience", type=int, default=15)
+    ap.add_argument("--grad-accum", type=int, default=1,
+                    help="accumulate gradients over N batches; e.g. --batch-size 8 --grad-accum 4 keeps the "
+                         "form's effective batch of 32 on a 40 GB A100")
     ap.add_argument("--warmup", type=int, default=500); ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--no-imaging", action="store_true", help="skip ECG/echo loading (EHR-only ablation)")
     ap.add_argument("--n-boot", type=int, default=1000)
@@ -115,7 +118,8 @@ def main(argv=None):
     dl_va, dl_te = DataLoader(va, **kw), DataLoader(te, **kw)
 
     opt = torch.optim.AdamW(model.param_groups())
-    total_steps = a.epochs * max(len(dl_tr), 1)
+    accum = max(1, a.grad_accum)
+    total_steps = a.epochs * max(-(-len(dl_tr) // accum), 1)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / a.warmup) *
                                               0.5 * (1 + math.cos(math.pi * min(s / total_steps, 1.0))))
     use_amp = dev == "cuda"
@@ -126,18 +130,20 @@ def main(argv=None):
     for epoch in range(a.epochs):
         model.set_imaging_frozen(epoch < cfg.freeze_imaging_backbones_epochs)
         model.train(); losses = []
-        for b in dl_tr:
+        opt.zero_grad(set_to_none=True)
+        for i, b in enumerate(dl_tr):
             b = {k: v.to(dev, non_blocking=True) for k, v in b.items()}
             p = step / total_steps
             lam = 2.0 / (1.0 + math.exp(-10 * p)) - 1.0          # DANN GRL schedule
             with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                 o = model(b, grl_lambda=lam)
             loss, parts = hcman_loss({k: v.float() for k, v in o.items()}, b, w, mc.condition_head)
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt); scaler.update(); sched.step(); step += 1
+            scaler.scale(loss / accum).backward()
+            if (i + 1) % accum == 0 or i + 1 == len(dl_tr):
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt); scaler.update(); sched.step(); step += 1
+                opt.zero_grad(set_to_none=True)
             losses.append(parts)
         pv = predict(model, dl_va, dev, mc.condition_head)
         score = macro_auroc(pv)

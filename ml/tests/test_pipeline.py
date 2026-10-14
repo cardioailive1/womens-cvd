@@ -89,6 +89,14 @@ def test_congenital_exclusion_uses_full_history(study):
     assert n.iloc[1] < n.iloc[0], "Q2x codes years before the study window must still exclude"
 
 
+def test_lab_code_coverage_report(study):
+    rep = pd.read_csv(Path(study["cfg"].report_dir) / "01b_lab_code_coverage.csv")
+    assert {"item", "loinc", "n_rows", "n_women"} <= set(rep.columns)
+    assert set(rep.item) >= {"bnp", "troponin_i", "creatinine"}
+    zero = rep[rep.loinc == "6598-7"]                       # troponin T: absent in synthetic data
+    assert str(zero.n_women.iloc[0]) == "0"
+
+
 def test_attrition_is_monotone(study):
     rep = pd.read_csv(Path(study["cfg"].report_dir) / "02_attrition.csv")
     n = pd.to_numeric(rep.n_women[:6], errors="coerce").dropna().values
@@ -181,6 +189,7 @@ def test_train_export_serve(study, tmp_path):
                        "--out", str(run), "--size", "small", "--epochs", "3", "--batch-size", "16",
                        "--warmup", "10", "--workers", "0", "--n-boot", "50",
                        "--report-dir", str(tmp_path / "reports"), "--site-adv-weight", "0.1",
+                       "--grad-accum", "2",
                        "--init-weights", str(pre_dir / "encoders.pt"),
                        "--preprocessors", str(pre_dir / "preprocessors.pkl")])
     assert best >= 0

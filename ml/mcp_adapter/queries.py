@@ -59,6 +59,23 @@ def resolve_loinc(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
     return df
 
 
+def lab_code_coverage(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
+    """Rows and women per LOINC code in the lab / vitals lists. A code with zero rows means the
+    platform maps that test to a different LOINC: look it up and add it in concepts.py."""
+    resolve_loinc(be, cfg)
+    cdm = cfg.cdm_schema
+    got = be.sql(f"""
+SELECT l.concept_code AS loinc, COUNT(*) AS n_rows, COUNT(DISTINCT m.person_id) AS n_women
+FROM {cdm}.measurement m JOIN hcman_loinc l ON l.concept_id = m.measurement_concept_id
+JOIN {cdm}.person p ON p.person_id = m.person_id AND p.gender_concept_id = {C.FEMALE_GENDER_CONCEPT_ID}
+GROUP BY l.concept_code""")
+    want = pd.DataFrame([(item, code) for item, spec in C.LABS.items() for code in spec["loinc"]]
+                        + [(item, code) for item, codes in C.VITALS.items() for code in codes],
+                        columns=["item", "loinc"])
+    out = want.merge(got, on="loinc", how="left").fillna({"n_rows": 0, "n_women": 0})
+    return out.astype({"n_rows": int, "n_women": int}).sort_values(["item", "n_women"], ascending=[True, False])
+
+
 # ------------------------------------------------------------------ pass 1
 def _events_sql(cfg: StudyConfig, grp_filter: str, person_filter: str = "",
                 full_history: bool = False) -> str:

@@ -1,6 +1,6 @@
 # HCMAN Training Runbook — Mayo Clinic Platform
 
-Last updated: Oct 14, 2026
+Last updated: Oct 14, 2026 (MCP answers of 14 Oct folded in)
 
 This runbook takes HCMAN from an empty Mayo Clinic Platform workbench to a trained, reviewed model the CardioAI app can call. It is the first training of the model: every encoder is pre-trained from scratch inside the platform, and ECG and echo imaging are required. All commands run from the `ml/` folder of the repository's `main` branch.
 
@@ -33,16 +33,19 @@ You need seven things in place before any code runs in the workbench; the code-r
 | Platform access | Approved Accelerate workspace, onboarding done, your user on the project | Mayo Clinic Platform |
 | Code approval | The repository (`ml/` folder, `main` branch) reviewed and whitelisted | Mayo Clinic Platform code review |
 | Imaging locations | Table or folder for 12-lead ECGs and for echo DICOM cine, the person key that links them to OMOP, and whether echo clips carry view labels | MCP technical mentor |
-| Compute | JupyterLab or VS Code workspace with at least 1 GPU (MCP offers up to 8× H100 80 GB), plus a persistent folder for outputs | Mayo Clinic Platform |
+| Compute | JupyterLab or VS Code workspace on one of MCP's shared-reservation A100 40 GB machines (confirmed); other machine types on request. Settings below are sized for 40 GB | Mayo Clinic Platform |
 | Export rules | The official small-cell threshold and the approval path for aggregate reports and model weights | Mayo Clinic Platform |
 | Clinical sign-off | Cardiologist review of the code lists in `ml/mcp_adapter/concepts.py` | Cardio AI clinical lead |
-| Annotation tool | Confirmation that JupyterLab widgets (`ipywidgets`) work in the workspace; this is what the built-in review tool uses. Ask too whether heavier tools (CVAT, OHIF, 3D Slicer with MONAI Label) are allowed, and whether MCP can supply existing echo view labels or echo-report data, which would shrink the manual work in Step 2b | MCP technical mentor |
+| Annotators | Up to 5 extra workspace seats for outside readers (confirmed). Mayo Clinic staff cannot annotate in your environment, so hire cardiologists or sonographers; each needs a `cardioailive.com` email | Cardio AI, then MCP to issue seats |
+| Imaging location | Where the echo and ECG DICOM files sit (table names and storage). Still open after the 14 Oct answers; MCP will cover it in the data training sessions | MCP technical mentor |
 
 **Roles for the run:**
 
 - **Run owner** — runs every step, keeps the run checklist at the end of this runbook.
-- **Clinical reviewers** — sign off code lists (Step 2), label echo clips (Step 2b, a sonographer or cardiologist), review records against the automatic labels (Step 4b, a cardiologist) and read the label prevalence report (Step 4).
+- **Clinical reviewers** — sign off code lists (Step 2), label echo clips (Step 2b, a sonographer or cardiologist), review records against the automatic labels (Step 4b, a cardiologist) and read the label prevalence report (Step 4). They must be outside readers on Cardio AI's annotator seats; Mayo staff cannot do this work.
 - **Approver** — decides go / no-go at the three gates (Steps 3–4) and accepts the model (Step 7).
+
+**What MCP confirmed (14 Oct 2026):** `pip install` works in the workspace; local web apps can run on localhost; Docker containers run but cannot pull images, so they must be self-contained; a remote desktop with 3D Slicer and ITK-SNAP is already installed. There are no existing image annotations on the platform; labels come from radiology reports and echo notes. Public datasets should stay outside the environment unless essential.
 
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
 
@@ -77,7 +80,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (31 at the time of writing). It takes about 12 minutes on CPU, less on GPU.
+   Expect every test to pass (32 at the time of writing). It takes about 12 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -112,17 +115,17 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
    ecg = _load_manifest(cfg.ecg_source, be).head(5)
    for p in ecg.path: print(load_ecg(p, cfg.ecg_source.kind).shape)     # (12, 5000)
    echo = _load_manifest(cfg.echo_source, be)
-   print(echo.view.value_counts())                 # PLAX / PSAX / A4C / A2C
+   print(len(echo), echo.columns.tolist())         # views are added in Step 2b if missing
    for p in echo.path.head(5): print(load_echo(p).shape)              # (16, 3, 224, 224)
    ```
 
-**Go when:** the ICD10CM concept count is in the tens of thousands, five ECGs load as (12, 5000), five echo clips load, and echo views are mostly the four named views. If views are missing, see Troubleshooting before continuing.
+**Go when:** the ICD10CM concept count is in the tens of thousands, five ECGs load as (12, 5000) and five echo clips load. If clips fail to load with a decoder error, see Troubleshooting.
 
 ## Step 2b — Annotate the echo clips (views and cardiac phase)
 
 Goal: every echo clip carries a view label (PLAX, PSAX, A4C, A2C or OTHER) and, where it can be found, its end-diastole (ED) and end-systole (ES) frame, before the study tables are built. HCMAN uses only clips with one of the four views. Most of the labelling is automatic; reviewers label a seed set and check what the automatic pass is unsure of.
 
-The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab, so nothing extra is installed beyond `ipywidgets`. Every label, automatic or human, is appended to a store file with who made it and when; human labels always win.
+The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; its only extra package, `ipywidgets`, is installed by `pip install -r requirements.txt` in Step 1. MCP also offers 3D Slicer and ITK-SNAP on a remote desktop, but those are for drawing outlines, which HCMAN does not use. Every label, automatic or human, is appended to a store file with who made it and when; human labels always win.
 
 1. **Automatic pass.** Point `echo_source` in `config/study.yaml` at the raw echo manifest (Step 2; the `view` column can be missing), then:
 
@@ -176,6 +179,8 @@ counts.sort_values("n_women", ascending=False)
 
 This writes `reports/01_feasibility_counts.csv`: distinct women per code group, counts under the threshold shown as `<11`. These are women with any code, before eligibility, so treat them as upper bounds; the real cohort numbers come in Step 4.
 
+It also writes `reports/01b_lab_code_coverage.csv`: rows and women for every LOINC code the model uses for labs and vitals. A lab with zero rows on every code means Mayo records that test under a different LOINC. Look the test up in the [Mayo Clinic Laboratories catalog](https://www.mayocliniclabs.com/search) (Clinical and Interpretive, then Fees & Codes, shows its LOINC), add the code to `mcp_adapter/concepts.py` and re-run.
+
 | Gate | Pass when | If it fails |
 | --- | --- | --- |
 | 1 · Enough cases | Each of the six conditions (`cond_*` rows) has ≥ 200 women, with margin for eligibility losses | Merge or drop that class from the condition head; record the decision |
@@ -222,7 +227,7 @@ Goal: measure how often the automatic condition labels are right before training
    save_context(fetch_context(be, cfg, t["cohort"], s.person_id), f"{WB}/annot/context.pkl")
    ```
 
-   Each record shows diagnoses, procedures and key labs from 30 days before index to the end of follow-up, plus clinical notes if the platform exposes the OMOP `note` table.
+   Each record shows diagnoses, procedures and key labs from 30 days before index to the end of follow-up, plus free-text reports. Those come from the OMOP `note` table if present, and from the Mayo tables MCP named: echo notes (`FACT_ECHO_TEST`, column `ECHO_NOTE`) and radiology reports (`FACT_RADIOLOGY`). Fill their remaining columns under `reports:` in `config/study.yaml` (patient key, date and, for radiology, the text column) after the MCP data training; a source with missing columns is skipped, not failed.
 2. **Review**, blinded: the reviewer never sees the automatic label.
 
    ```python
@@ -266,7 +271,7 @@ Goal: every encoder learns from Mayo data without labels before it sees the coho
        --out $WB/pretrain_smoke --epochs 1
    ```
 
-   Read each stage's epoch time from the log and multiply by the configured epochs (ECG 30, echo 30, EHR 20, labs 20). If memory runs out, lower `pretraining.batch_size` (256 → 128 → 64).
+   Read each stage's epoch time from the log and multiply by the configured epochs (ECG 30, echo 30, EHR 20, labs 20). `pretraining.batch_size` is 64 for the 40 GB A100s; if memory runs out, lower it to 32.
 3. **Run the full pre-training** in the background so it survives a closed browser tab:
 
    ```bash
@@ -288,7 +293,7 @@ Goal: the full HCMAN, starting from the pre-trained encoders, trained on the coh
 
    ```bash
    nohup python -m hcman.train --config config/study.yaml --study-dir $WB/hcman_study \
-       --out $WB/run_ablation --report-dir $WB/reports_ablation \
+       --out $WB/run_ablation --report-dir $WB/reports_ablation --batch-size 8 --grad-accum 4 \
        --init-weights $WB/pretrain/encoders.pt --preprocessors $WB/pretrain/preprocessors.pkl \
        --no-imaging > $WB/run_ablation.log 2>&1 &
    ```
@@ -296,12 +301,12 @@ Goal: the full HCMAN, starting from the pre-trained encoders, trained on the coh
 
    ```bash
    nohup python -m hcman.train --config config/study.yaml --study-dir $WB/hcman_study \
-       --out $WB/run_full --report-dir $WB/reports_full \
+       --out $WB/run_full --report-dir $WB/reports_full --batch-size 8 --grad-accum 4 \
        --init-weights $WB/pretrain/encoders.pt --preprocessors $WB/pretrain/preprocessors.pkl \
        > $WB/run_full.log 2>&1 &
    ```
 
-   Add `--site-adv-weight 0` if gate 3 failed. Always pass both `--init-weights` and `--preprocessors` from the same pre-training run; the script refuses one without the other, because token ids must match.
+   `--batch-size 8 --grad-accum 4` keeps the form's effective batch of 32 while fitting a 40 GB A100; on a larger GPU use `--batch-size 32 --grad-accum 1`. Add `--site-adv-weight 0` if gate 3 failed. Always pass both `--init-weights` and `--preprocessors` from the same pre-training run; the script refuses one without the other, because token ids must match.
 3. **Watch the log** (`tail -f $WB/run_full.log`). Each epoch prints training loss and validation macro-AUROC across the six conditions. Training stops after 15 epochs without improvement (max 100); the best epoch is saved as `hcman_best.pt`.
 
 Settings come from the Model Details Form: AdamW at 1e-4 / 3e-4 / 5e-4 (encoders / fusion / heads), batch 32, 500-step warmup then cosine, FP16, gradient clipping 1.0. ECG and echo encoders stay frozen for the first 5 epochs (`model.freeze_imaging_backbones_epochs`).
@@ -371,11 +376,12 @@ Known gap: the app does not yet send ECG, echo, diagnosis history or medications
 | `imaging manifest ... lacks columns` | MCP's table uses other column names | Create a Spark view renaming them to `person_id`, `record_date`, `path`, `view`; point `manifest` at `sql:<view>` |
 | ICD10CM concept count is 0 | Wrong `vocab_schema` | Find the schema holding `concept` in the Schema Visualizer |
 | Feasibility counts all zero or tiny | Mayo's ETL leaves `condition_source_concept_id` empty | Check `SELECT COUNT(*) ... WHERE condition_source_concept_id > 0`; if empty, the code must match on `condition_source_value` instead — raise it before continuing |
-| Report 05 shows echo for almost nobody | Echo clips lack a recognised `view` (records without PLAX/PSAX/A4C/A2C are skipped) | Ask MCP for view labels; otherwise a view classifier must be added before training |
-| Echo clips marked UNREADABLE | Compressed DICOM (e.g. JPEG) without a decoder installed | Ask MCP to add `pylibjpeg` and `pylibjpeg-libjpeg` (or GDCM) to the environment, then re-run `annotate.echo auto` |
-| The review tool prints text instead of showing widgets | The JupyterLab widgets extension is not enabled | Ask MCP to enable `ipywidgets` in JupyterLab; the tool needs nothing else |
+| Report 05 shows echo for almost nobody | Echo clips have no recognised `view` (records without PLAX/PSAX/A4C/A2C are skipped) | Step 2b was skipped or not finalized; MCP has no view labels to supply, so run Step 2b and point `echo_source.manifest` at the annotated file |
+| Echo clips marked UNREADABLE | Compressed DICOM (e.g. JPEG) without a decoder installed | Run `pip install -r requirements.txt` again (it includes the `pylibjpeg` decoders), then re-run `annotate.echo auto` |
+| The review tool prints text instead of showing widgets | `ipywidgets` installed after JupyterLab started | Restart the JupyterLab kernel (or the server) after `pip install`; if it persists, ask MCP |
+| A lab is missing from report 01b | Mayo maps that test to a LOINC not in `concepts.py` | Find the LOINC in the Mayo Clinic Laboratories catalog and add it |
 | `train-views` says it needs more labelled clips per view | Seed set too small or missing a view | Keep labelling in the review queue until every view has at least 5 (aim for 100) |
-| CUDA out of memory | Batch too large for the GPU | Pre-training: lower `pretraining.batch_size`. Fine-tuning: `--batch-size 16` |
+| CUDA out of memory | Batch too large for the GPU | Pre-training: lower `pretraining.batch_size` to 32. Fine-tuning: `--batch-size 4 --grad-accum 8` (same effective batch) |
 | A pre-training loss never falls | Inputs failed to load (zeros) or learning rate too high for that stage | Run Step 2's load check on 20 records from that stage's manifest; check the log for load errors |
 | `init weights do not match this model size` | Pre-training and fine-tuning used different `--size` | Use the same size (default `full`) for both |
 | `--init-weights needs --preprocessors` | Only one pre-training output passed | Pass both files from the same pre-training folder |
@@ -399,9 +405,11 @@ Tick each item as it is done; write the run folder names and decisions next to t
 
 **Before you start**
 
-- [ ] Workspace approved and GPU confirmed
+- [ ] Workspace approved and A100 40 GB reservation confirmed
+- [ ] Outside annotators hired; up to 5 seats issued with `cardioailive.com` accounts
 - [ ] `ml/` code reviewed and whitelisted by MCP
-- [ ] ECG and echo locations, person key and view labels received from the MCP mentor
+- [ ] ECG and echo DICOM locations and person key received from the MCP mentor (still open)
+- [ ] Report table columns filled under `reports:` in `config/study.yaml`
 - [ ] Official small-cell threshold and export path received
 
 **Setup and data**
@@ -411,7 +419,7 @@ Tick each item as it is done; write the run folder names and decisions next to t
 - [ ] Step 2: clinical reviewer signed off `concepts.py`
 - [ ] Step 2b: echo seed set labelled; view model trained; QA report meets the limits
 - [ ] Step 2b: annotated echo manifest set in `config/study.yaml`
-- [ ] Step 3: gate 1 signed (cases per condition)
+- [ ] Step 3: gate 1 signed (cases per condition); report 01b shows every lab found
 - [ ] Step 4: reports 02–06 reviewed; gate 2 (imaging coverage) and gate 3 (sites) signed
 - [ ] Step 4b: chart review done; PPV meets the limit for every condition (report 09c)
 

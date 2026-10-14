@@ -56,6 +56,8 @@ class StudyConfig:
     model_size: str = "full"
     freeze_imaging_backbones_epochs: int = 5
 
+    report_sources: dict[str, dict] = field(default_factory=dict)
+
     pretrain: dict[str, int] = field(default_factory=lambda: {
         "max_women": 200000, "ecg_epochs": 30, "echo_epochs": 30, "ehr_epochs": 20,
         "labs_epochs": 20, "batch_size": 256})
@@ -102,6 +104,7 @@ class StudyConfig:
             freeze_imaging_backbones_epochs=m.get("freeze_imaging_backbones_epochs", 5),
         )
         cfg.pretrain.update(pt)
+        cfg.report_sources = {k: v for k, v in (raw.get("reports") or {}).items() if v}
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg

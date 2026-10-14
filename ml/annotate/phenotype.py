@@ -110,7 +110,30 @@ FROM {cdm}.note x JOIN {REVIEW_VIEW} w ON w.person_id = x.person_id
 WHERE {d('x.note_date')} BETWEEN {lo} AND {hi}""")
     except Exception:          # NOTE table not exposed on this platform/schema
         notes = pd.DataFrame(columns=["person_id", "rel_day", "title", "text"])
+    parts = [notes] + [report_notes(be, cfg, name, src, lo, hi)
+                       for name, src in cfg.report_sources.items()]
+    notes = pd.concat([p for p in parts if len(p)] or [notes], ignore_index=True)
     return {"diagnoses": dx, "procedures": px, "labs": labs, "notes": notes}
+
+
+def report_notes(be: Backend, cfg: StudyConfig, name: str, src: dict, lo: int, hi: int) -> pd.DataFrame:
+    """Free-text reports from a Mayo-native table (e.g. echo notes, radiology reports) configured
+    under `reports:` in study.yaml. Skipped, not failed, until all four columns are configured."""
+    empty = pd.DataFrame(columns=["person_id", "rel_day", "title", "text"])
+    need = ("table", "person_column", "date_column", "text_column")
+    if not all(src.get(k) for k in need):
+        return empty
+    d = days_between(cfg.dialect, f"r.{src['date_column']}", "w.index_date")
+    try:
+        return be.sql(f"""
+SELECT r.{src['person_column']} AS person_id, {d} AS rel_day, '{name}' AS title,
+       r.{src['text_column']} AS text
+FROM {src['table']} r JOIN {REVIEW_VIEW} w ON w.person_id = r.{src['person_column']}
+WHERE {d} BETWEEN {lo} AND {hi}""")
+    except Exception as e:
+        import logging
+        logging.getLogger("annotate.phenotype").warning("report source %s skipped: %s", name, e)
+        return empty
 
 
 def save_context(ctx: dict[str, pd.DataFrame], path: str | Path) -> None:
