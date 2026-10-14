@@ -1,44 +1,47 @@
 # HCMAN Training Runbook — Mayo Clinic Platform
 
-Last updated: Oct 13, 2026
+Last updated: Oct 14, 2026
 
-This runbook takes HCMAN from an empty Mayo Clinic Platform workbench to a trained, reviewed model the CardioAI app can call. It is the first training of the model: every encoder is pre-trained from scratch inside the platform, and ECG and echo imaging are required. All commands run from the `ml/` folder of branch `hcman-mcp-training`.
+This runbook takes HCMAN from an empty Mayo Clinic Platform workbench to a trained, reviewed model the CardioAI app can call. It is the first training of the model: every encoder is pre-trained from scratch inside the platform, and ECG and echo imaging are required. All commands run from the `ml/` folder of the repository's `main` branch.
 
 ## At a glance
 
 ```mermaid
 flowchart LR
-    S1["1 · Setup<br/>13 tests pass"] --> S2["2 · Configure<br/>5 ECG + 5 echo load"]
-    S2 --> S3["3 · Feasibility<br/>Gate 1: enough cases"]
+    S1["1 · Setup<br/>all tests pass"] --> S2["2 · Configure<br/>5 ECG + 5 echo load"]
+    S2 --> S2b["2b · Annotate echo<br/>views + ED/ES"]
+    S2b --> S3["3 · Feasibility<br/>Gate 1: enough cases"]
     S3 --> S4["4 · Study tables<br/>Gates 2, 3: imaging, sites"]
-    S4 --> S5["5 · Pre-train<br/>4 stages, no labels"]
+    S4 --> S4b["4b · Chart review<br/>label PPV / NPV"]
+    S4b --> S5["5 · Pre-train<br/>4 stages, no labels"]
     S5 --> S6["6 · Fine-tune<br/>ablation, then full"]
     S6 --> S7["7 · Evaluate<br/>accept or iterate"]
     S7 -- "iterate: new run folder" --> S6
     S7 -- accepted --> S8["8 · Export + app<br/>staging, then live"]
     classDef gate fill:#e3eefc,stroke:#2f6fdb,stroke-width:2px;
-    class S3,S4,S7 gate;
+    class S2b,S3,S4,S4b,S7 gate;
 ```
 
 Highlighted steps end in a go / no-go decision; a run that is not accepted goes back to fine-tuning in a new run folder, never over the old one.
 
 ## Before you start
 
-You need six things in place before any code runs in the workbench; the code-review approval usually takes longest, so request it first.
+You need seven things in place before any code runs in the workbench; the code-review approval usually takes longest, so request it first.
 
 | Item | What you need | Who provides it |
 | --- | --- | --- |
 | Platform access | Approved Accelerate workspace, onboarding done, your user on the project | Mayo Clinic Platform |
-| Code approval | The repository (`ml/` folder, branch `hcman-mcp-training`) reviewed and whitelisted | Mayo Clinic Platform code review |
+| Code approval | The repository (`ml/` folder, `main` branch) reviewed and whitelisted | Mayo Clinic Platform code review |
 | Imaging locations | Table or folder for 12-lead ECGs and for echo DICOM cine, the person key that links them to OMOP, and whether echo clips carry view labels | MCP technical mentor |
 | Compute | JupyterLab or VS Code workspace with at least 1 GPU (MCP offers up to 8× H100 80 GB), plus a persistent folder for outputs | Mayo Clinic Platform |
 | Export rules | The official small-cell threshold and the approval path for aggregate reports and model weights | Mayo Clinic Platform |
 | Clinical sign-off | Cardiologist review of the code lists in `ml/mcp_adapter/concepts.py` | Cardio AI clinical lead |
+| Annotation tool | Confirmation that JupyterLab widgets (`ipywidgets`) work in the workspace; this is what the built-in review tool uses. Ask too whether heavier tools (CVAT, OHIF, 3D Slicer with MONAI Label) are allowed, and whether MCP can supply existing echo view labels or echo-report data, which would shrink the manual work in Step 2b | MCP technical mentor |
 
 **Roles for the run:**
 
 - **Run owner** — runs every step, keeps the run checklist at the end of this runbook.
-- **Clinical reviewer** — signs off code lists (Step 2) and the label prevalence report (Step 4).
+- **Clinical reviewers** — sign off code lists (Step 2), label echo clips (Step 2b, a sonographer or cardiologist), review records against the automatic labels (Step 4b, a cardiologist) and read the label prevalence report (Step 4).
 - **Approver** — decides go / no-go at the three gates (Steps 3–4) and accepts the model (Step 7).
 
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
@@ -53,7 +56,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
 
    ```bash
    cd $WB
-   git clone -b hcman-mcp-training https://github.com/cardioailive1/womens-cvd
+   git clone https://github.com/cardioailive1/womens-cvd
    cd womens-cvd/ml
    ```
 2. Install the Python dependencies. If the workspace has no outbound package access, give `requirements.txt` to the MCP mentor and ask for those packages in your environment.
@@ -74,9 +77,9 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect `13 passed`. It takes about 6 minutes on CPU, less on GPU.
+   Expect every test to pass (31 at the time of writing). It takes about 12 minutes on CPU, less on GPU.
 
-**Go when:** all 13 tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
+**Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
 ## Step 2 — Point the config at OMOP and the imaging data
 
@@ -114,6 +117,52 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
    ```
 
 **Go when:** the ICD10CM concept count is in the tens of thousands, five ECGs load as (12, 5000), five echo clips load, and echo views are mostly the four named views. If views are missing, see Troubleshooting before continuing.
+
+## Step 2b — Annotate the echo clips (views and cardiac phase)
+
+Goal: every echo clip carries a view label (PLAX, PSAX, A4C, A2C or OTHER) and, where it can be found, its end-diastole (ED) and end-systole (ES) frame, before the study tables are built. HCMAN uses only clips with one of the four views. Most of the labelling is automatic; reviewers label a seed set and check what the automatic pass is unsure of.
+
+The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab, so nothing extra is installed beyond `ipywidgets`. Every label, automatic or human, is appended to a store file with who made it and when; human labels always win.
+
+1. **Automatic pass.** Point `echo_source` in `config/study.yaml` at the raw echo manifest (Step 2; the `view` column can be missing), then:
+
+   ```bash
+   python -m annotate.echo auto --config config/study.yaml \
+       --store $WB/annot/echo.csv --cache $WB/annot/cache --workers 8
+   ```
+
+   Views come from the DICOM metadata (view name, series description, protocol); colour-Doppler and single-frame images become OTHER. ED comes from the ECG R-wave times stored in the DICOM when present; otherwise, and for ES always, from the change in dark blood-pool area across frames. The command prints how many clips went to the review queue.
+2. **Seed review.** In a notebook cell:
+
+   ```python
+   import sys; sys.path.insert(0, ".")
+   from annotate.review_ui import EchoReviewer
+   EchoReviewer(store=f"{WB}/annot/echo.csv", cache=f"{WB}/annot/cache", annotator="<your name>").show()
+   ```
+
+   For each clip: pick the view, move the frame slider and press **ED = this frame** and **ES = this frame** (the trace under the image shows the proposed frames), then **Save and next**. Use UNUSABLE for clips too poor to read. Label at least 100 clips per view on the first round.
+3. **Train the view model and re-run** the automatic pass with it:
+
+   ```bash
+   python -m annotate.echo train-views --store $WB/annot/echo.csv --cache $WB/annot/cache \
+       --out $WB/annot/view_model.pt
+   python -m annotate.echo auto --config config/study.yaml --store $WB/annot/echo.csv \
+       --cache $WB/annot/cache --view-model $WB/annot/view_model.pt
+   ```
+
+   Clips are decoded only once, so re-runs are quick. Repeat steps 2 and 3 until the queue is small. The queue always includes a fixed 5% sample of confidently auto-labelled clips, which measures how accurate the automatic labels are.
+4. **Check and finalize:**
+
+   ```bash
+   python -m annotate.echo qa-report --config config/study.yaml --store $WB/annot/echo.csv
+   python -m annotate.echo finalize --config config/study.yaml --store $WB/annot/echo.csv \
+       --out $WB/annot/echo_manifest_annotated.parquet
+   ```
+
+   `qa-report` writes `reports/09b_echo_annotation_qa.csv` (auto-vs-human agreement); `finalize` writes the annotated manifest and `reports/09a_echo_views.csv`. A clip whose automatic view is below 0.9 confidence and that no one reviewed gets no view, so it is left out rather than trained on as a guess.
+5. **Use the annotated manifest:** in `config/study.yaml` set `echo_source.manifest` to `$WB/annot/echo_manifest_annotated.parquet` and `echo_source.path` to `null` (its paths are already complete).
+
+**Go when:** on the QA sample, view agreement is at least 0.95 and ED is within 2 frames of the reviewer's in at least 90% of clips (proposed limits; agree them before the run), and report 09a shows most clips have a view.
 
 ## Step 3 — Feasibility counts and the three gates
 
@@ -157,6 +206,45 @@ Row-level tables land in `$WB/hcman_study/` and must stay there. Review each rep
 | 06_definitions | Code lists and feature provenance used in this run | Differs from the signed-off concept lists |
 
 The clinical reviewer reads 04 for plausibility; the approver signs gates 2 and 3. If you change anything in the config, rebuild — the splits are seeded, so the same config always gives the same split.
+
+## Step 4b — Chart review of the automatic labels
+
+Goal: measure how often the automatic condition labels are right before training on them. The labels come from diagnosis codes, and a cardiologist checks a sample of records against them. This is where errors such as catheter-induced coronary dissections counted as SCAD show up.
+
+1. **Draw the sample and pull the records** (same notebook as Step 4). For each condition: 50 women the rules call positive, and 50 they call negative, half of them "near misses" that had a code but did not meet the rule:
+
+   ```python
+   import pandas as pd
+   from annotate.phenotype import sample_for_review, fetch_context, save_context
+   ev = pd.read_pickle(f"{WB}/hcman_study/code_events.pkl")
+   s = sample_for_review(t["labels"], ev, n_pos=50, n_neg=50)
+   s.to_csv(f"{WB}/annot/phenotype_sample.csv", index=False)
+   save_context(fetch_context(be, cfg, t["cohort"], s.person_id), f"{WB}/annot/context.pkl")
+   ```
+
+   Each record shows diagnoses, procedures and key labs from 30 days before index to the end of follow-up, plus clinical notes if the platform exposes the OMOP `note` table.
+2. **Review**, blinded: the reviewer never sees the automatic label.
+
+   ```python
+   from annotate.review_ui import PhenotypeReviewer
+   PhenotypeReviewer(sample=f"{WB}/annot/phenotype_sample.csv", context=f"{WB}/annot/context.pkl",
+                     store=f"{WB}/annot/phenotype.csv", annotator="<your name>").show()
+   ```
+
+   Answer the question shown (for example "Spontaneous coronary artery dissection, not iatrogenic or traumatic?") with Yes, No or Unsure, and add a short note when the answer is No.
+3. **Report:**
+
+   ```python
+   from annotate.phenotype import validation_report
+   from annotate.store import AnnotationStore
+   from mcp_adapter.privacy import write_report
+   rep = validation_report(s, AnnotationStore(f"{WB}/annot/phenotype.csv"), cfg.min_cell_size)
+   write_report(rep, "09c_phenotype_validation", cfg.report_dir); rep
+   ```
+
+   `09c_phenotype_validation.csv` gives PPV and NPV per condition with 95% confidence intervals. With 50 reviewed positives, PPV is known to about ±0.1.
+
+**Go when:** PPV is at least 0.80 for every condition (proposed; agree it before the review). If one falls short, read the reviewers' notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and review a fresh sample.
 
 ## Step 5 — Build the pre-training pool and pre-train from scratch
 
@@ -271,7 +359,7 @@ Goal: the accepted model leaves the platform through the Model Details Form revi
    curl http://<host>:8080/health
    ```
 4. **Connect a staging copy of the app** by setting `ASSESSMENT_ENGINE=hcman` and `HCMAN_INFERENCE_URL=http://<host>:8080`. Run assessments and compare with the rules engine on the same patients. Each Assessment records which engine and model version produced it; if the service is down, the app falls back to rules and the audit log says why.
-5. **Go live** only after clinical review of the staging comparison: merge `hcman-mcp-training`, then set the same two variables on the production Render service. Leaving `ASSESSMENT_ENGINE=rules` keeps today's behaviour.
+5. **Go live** only after clinical review of the staging comparison: set the same two variables on the production Render service. Leaving `ASSESSMENT_ENGINE=rules` keeps today's behaviour.
 
 Known gap: the app does not yet send ECG, echo, diagnosis history or medications, so in the app HCMAN runs with those streams masked and says so in its recommendations. Validate that configuration before go-live, or add those inputs to the app.
 
@@ -284,6 +372,9 @@ Known gap: the app does not yet send ECG, echo, diagnosis history or medications
 | ICD10CM concept count is 0 | Wrong `vocab_schema` | Find the schema holding `concept` in the Schema Visualizer |
 | Feasibility counts all zero or tiny | Mayo's ETL leaves `condition_source_concept_id` empty | Check `SELECT COUNT(*) ... WHERE condition_source_concept_id > 0`; if empty, the code must match on `condition_source_value` instead — raise it before continuing |
 | Report 05 shows echo for almost nobody | Echo clips lack a recognised `view` (records without PLAX/PSAX/A4C/A2C are skipped) | Ask MCP for view labels; otherwise a view classifier must be added before training |
+| Echo clips marked UNREADABLE | Compressed DICOM (e.g. JPEG) without a decoder installed | Ask MCP to add `pylibjpeg` and `pylibjpeg-libjpeg` (or GDCM) to the environment, then re-run `annotate.echo auto` |
+| The review tool prints text instead of showing widgets | The JupyterLab widgets extension is not enabled | Ask MCP to enable `ipywidgets` in JupyterLab; the tool needs nothing else |
+| `train-views` says it needs more labelled clips per view | Seed set too small or missing a view | Keep labelling in the review queue until every view has at least 5 (aim for 100) |
 | CUDA out of memory | Batch too large for the GPU | Pre-training: lower `pretraining.batch_size`. Fine-tuning: `--batch-size 16` |
 | A pre-training loss never falls | Inputs failed to load (zeros) or learning rate too high for that stage | Run Step 2's load check on 20 records from that stage's manifest; check the log for load errors |
 | `init weights do not match this model size` | Pre-training and fine-tuning used different `--size` | Use the same size (default `full`) for both |
@@ -315,11 +406,14 @@ Tick each item as it is done; write the run folder names and decisions next to t
 
 **Setup and data**
 
-- [ ] Step 1: 13 tests pass in the workbench
+- [ ] Step 1: all tests pass in the workbench
 - [ ] Step 2: schemas and imaging sources set; 5 ECGs and 5 echo clips load
 - [ ] Step 2: clinical reviewer signed off `concepts.py`
+- [ ] Step 2b: echo seed set labelled; view model trained; QA report meets the limits
+- [ ] Step 2b: annotated echo manifest set in `config/study.yaml`
 - [ ] Step 3: gate 1 signed (cases per condition)
 - [ ] Step 4: reports 02–06 reviewed; gate 2 (imaging coverage) and gate 3 (sites) signed
+- [ ] Step 4b: chart review done; PPV meets the limit for every condition (report 09c)
 
 **Training**
 

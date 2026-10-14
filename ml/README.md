@@ -20,6 +20,7 @@ mcp_adapter/             OMOP CDM v5.4 -> HCMAN inputs (runs inside the MCP work
   splits.py, privacy.py  patient-level splits; small-cell suppression for every report
   pipeline.py            run_feasibility(), build_study(), build_pretraining_pool()
 hcman/                   PyTorch model, pre-training, training, evaluation, export, serving
+annotate/                echo view + ED/ES auto-annotation, Jupyter review tool, chart review of labels
 tests/                   synthetic OMOP database + end-to-end tests
 ```
 
