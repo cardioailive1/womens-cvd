@@ -105,7 +105,7 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
    python -m mcp_adapter.imaging_sources request --config config/study.yaml --out $WB/imaging/dicom_request.csv
    ```
 
-   Check `reports/00_dicom_request.csv` for the number of studies (and how many are dated), women and instances, then submit the list (one row per `STUDY_INSTANCE_UID`) through MCP's request process. When the files are delivered, link each one back to its woman and date:
+   This writes two files. `dicom_request.csv` is the working list the manifest step uses later. `dicom_request_deid_submission.csv` is what MCP asked for: exactly `STUDY_INSTANCE_UID`, `PATIENT_DK`, `MODALITY` and `STMO_NAME_IN_ADL`, one row per study, modality and storage segment. Check `reports/00_dicom_request.csv` for the number of studies (and how many are dated), women and instances, then give the submission CSV to the MCP Technical Success Manager, who submits the studies for de-identification. It holds patient keys, so hand it over the way the TSM specifies (for example, left in the workspace), not by email. When the files are delivered, link each one back to its woman and date:
 
    ```bash
    python -m mcp_adapter.imaging_sources manifest --config config/study.yaml \
@@ -437,7 +437,8 @@ Tick each item as it is done; write the run folder names and decisions next to t
 - [ ] Outside annotators hired; up to 5 seats issued with `cardioailive.com` accounts; each annotator's DUA form submitted
 - [ ] `ml/` code reviewed and whitelisted by MCP
 - [ ] Radiology training done: request process known; clinic-number mapping confirmed; `FACT_ECHO_TEST` date and patient columns set; ECG storage format known
-- [ ] DICOM request list submitted (report 00); files delivered; echo (and ECG) manifests built
+- [ ] De-identification submission CSV (`STUDY_INSTANCE_UID`, `PATIENT_DK`, `MODALITY`, `STMO_NAME_IN_ADL`) given to the TSM; report 00 checked
+- [ ] De-identified files delivered; echo (and ECG) manifests built
 - [ ] Report table columns filled under `reports:` in `config/study.yaml`
 - [ ] Official small-cell threshold and export path received
 

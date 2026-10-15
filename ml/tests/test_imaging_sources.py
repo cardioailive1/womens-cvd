@@ -48,7 +48,8 @@ def test_dicom_request_list(db, tmp_path):
         def study(tag, modality, desc, status="Ready", date=None, n=3):
             uid = f"{tag}.{i}"
             for k in range(n):
-                inv.append((mc, uid, f"{uid}.s{k % 2}", f"{uid}.i{k}", f"A{uid}", modality, "CARDIO", desc, status))
+                inv.append((mc, 900000 + r.person_id, uid, f"{uid}.s{k % 2}", f"{uid}.i{k}", f"A{uid}",
+                            modality, "CARDIO", desc, status))
             if date is not None:
                 rad.append((f"A{uid}", date))
         study("NEAR", "US", "TTE ECHO COMPLETE", date=d)                       # keep
@@ -57,7 +58,7 @@ def test_dicom_request_list(db, tmp_path):
         study("CT", "CT", "CT CHEST", date=d)                                   # wrong modality
         study("OB", "US", "OB ULTRASOUND", date=d)                              # not cardiac
         study("NA", "US", "TTE ECHO", status="Not Available", date=d)            # cannot be de-identified
-    cols = ["PATIENT_CLINIC_NUMBER", "STUDY_INSTANCE_UID", "SERIES_INSTANCE_UID", "SOP_INSTANCE_UID",
+    cols = ["PATIENT_CLINIC_NUMBER", "PATIENT_DK", "STUDY_INSTANCE_UID", "SERIES_INSTANCE_UID", "SOP_INSTANCE_UID",
             "DICOM_ACCESSION_NUMBER", "MODALITY", "STMO_NAME_IN_ADL", "STUDY_DESCRIPTION", "IMAGE_DEID_STATUS"]
     db.register("inv_df", pd.DataFrame(inv, columns=cols))
     db.execute("CREATE OR REPLACE TABLE FACT_RADIOLOGY_DICOM_INVENTORY AS SELECT * FROM inv_df")
@@ -76,6 +77,14 @@ def test_dicom_request_list(db, tmp_path):
     req2 = build_dicom_request(DuckDBBackend(db), cfg, tmp_path / "req2.csv")
     assert set(req2.study_uid.str.split(".").str[0]) == {"NEAR"}
     assert (tmp_path / "rep" / "00_dicom_request.csv").exists()
+
+    # the CSV MCP asked for: exactly these columns, one row per study / modality / STMO
+    sub = pd.read_csv(tmp_path / "req_deid_submission.csv")
+    assert list(sub.columns) == ["STUDY_INSTANCE_UID", "PATIENT_DK", "MODALITY", "STMO_NAME_IN_ADL"]
+    assert sorted(sub.STUDY_INSTANCE_UID) == sorted(req.study_uid)
+    assert (sub.MODALITY == "US").all() and (sub.STMO_NAME_IN_ADL == "CARDIO").all()
+    assert not sub.duplicated().any()
+    assert set(sub.PATIENT_DK) == {900000 + p for p in req.person_id}
 
 
 def _muse(seed):

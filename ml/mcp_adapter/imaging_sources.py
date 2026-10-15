@@ -47,17 +47,26 @@ def person_join(cfg: StudyConfig, alias: str, key_expr: str) -> str:
 
 
 # ------------------------------------------------------------------ DICOM request list
+SUBMISSION_COLUMNS = ["STUDY_INSTANCE_UID", "PATIENT_DK", "MODALITY", "STMO_NAME_IN_ADL"]
+
+
 def build_dicom_request(be: Backend, cfg: StudyConfig, out_csv: str | Path,
-                        exclude_person_ids=None) -> pd.DataFrame:
+                        exclude_person_ids=None, submission_csv: str | Path | None = None) -> pd.DataFrame:
     """Study-level request list from FACT_RADIOLOGY_DICOM_INVENTORY (one row per DICOM instance).
 
     Keeps instances that can be de-identified, of the configured modality and study description,
-    belonging to women with a cardiac evaluation; groups them into studies; dates each study
-    (FACT_RADIOLOGY via accession number by default) and keeps those within `window_days` of a
-    cardiac evaluation, plus undated studies when `keep_undated` is set. Writes the list and a
-    suppressed count report."""
+    belonging to women with a cardiac evaluation; groups them by study, modality and storage
+    segment (STMO), the key MCP joins on; dates each study (FACT_RADIOLOGY via accession number by
+    default) and keeps those within `window_days` of a cardiac evaluation, plus undated studies
+    when `keep_undated` is set.
+
+    Writes two files: the working list (`out_csv`, with person_id, dates and counts, for the
+    manifest step) and the de-identification submission MCP asks for (`submission_csv`, default
+    `<out_csv stem>_deid_submission.csv`): exactly STUDY_INSTANCE_UID, PATIENT_DK, MODALITY,
+    STMO_NAME_IN_ADL, one row per study / modality / STMO. Plus a suppressed count report."""
     inv = cfg.dicom_inventory
-    _require("dicom_inventory", inv, ("table", "patient_column", "study_uid_column"))
+    _require("dicom_inventory", inv, ("table", "patient_column", "study_uid_column", "patient_dk_column",
+                                      "modality_column", "stmo_column"))
     evals = Q.cardiac_eval_events(be, cfg)[["person_id", "event_date"]].drop_duplicates()
     if exclude_person_ids is not None:
         evals = evals[~evals.person_id.isin(set(exclude_person_ids))]
@@ -73,8 +82,11 @@ def build_dicom_request(be: Backend, cfg: StudyConfig, out_csv: str | Path,
         col = f"UPPER(i.{inv['description_column']})"
         pat = inv["description_pattern"].replace("'", "''")
         cond.append(f"regexp_matches({col}, '{pat}')" if cfg.dialect == "duckdb" else f"{col} RLIKE '{pat}'")
-    opt = {k: inv.get(f"{k}_column") for k in ("accession", "modality", "stmo", "description")}
-    sel = "".join(f", MAX(i.{c}) AS {k}" for k, c in opt.items() if c)
+    keys = {"modality": inv["modality_column"], "stmo": inv["stmo_column"], "patient_dk": inv["patient_dk_column"]}
+    opt = {k: inv.get(f"{k}_column") for k in ("accession", "description")}
+    sel = "".join(f", i.{c} AS {k}" for k, c in keys.items())
+    sel += "".join(f", MAX(i.{c}) AS {k}" for k, c in opt.items() if c)
+    group = ", ".join(f"i.{c}" for c in keys.values())
     nser = f", COUNT(DISTINCT i.{inv['series_uid_column']}) AS n_series" if inv.get("series_uid_column") else ""
     inv_date = (f", MIN(CAST(i.{inv['date_column']} AS DATE)) AS study_date"
                 if inv.get("date_source") == "inventory" and inv.get("date_column") else "")
@@ -83,7 +95,7 @@ SELECT i.{inv['study_uid_column']} AS study_uid, pm.person_id, COUNT(*) AS n_ins
 FROM {inv['table']} i {person_join(cfg, 'pm', 'i.' + inv['patient_column'])}
 JOIN hcman_eval_people e ON e.person_id = pm.person_id
 {'WHERE ' + ' AND '.join(cond) if cond else ''}
-GROUP BY i.{inv['study_uid_column']}, pm.person_id""")
+GROUP BY i.{inv['study_uid_column']}, pm.person_id, {group}""")
 
     if inv.get("date_source") == "fact_radiology" and "accession" in studies and len(studies):
         be.register(studies[["study_uid", "accession"]].dropna(), "hcman_req_acc")
@@ -107,6 +119,12 @@ GROUP BY a.study_uid""")
 
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
+    sub = (df.rename(columns={"study_uid": "STUDY_INSTANCE_UID", "patient_dk": "PATIENT_DK",
+                              "modality": "MODALITY", "stmo": "STMO_NAME_IN_ADL"})[SUBMISSION_COLUMNS]
+             .drop_duplicates().sort_values(SUBMISSION_COLUMNS))
+    submission_csv = Path(submission_csv or Path(out_csv).with_name(Path(out_csv).stem + "_deid_submission.csv"))
+    sub.to_csv(submission_csv, index=False)
+    log.info("de-identification submission for the TSM: %d rows -> %s", len(sub), submission_csv)
     rep = pd.DataFrame([{"item": "studies", "n": df.study_uid.nunique()},
                         {"item": "studies with a date", "n": int(df.dated.sum())},
                         {"item": "women", "n": df.person_id.nunique()},
@@ -214,6 +232,8 @@ def main(argv=None):
     ap.add_argument("--files", help="manifest: folder the requested DICOMs were delivered to")
     ap.add_argument("--request", help="manifest: the request list CSV made by `request`")
     ap.add_argument("--modality", default="US", help="manifest: keep only this DICOM modality ('' = all)")
+    ap.add_argument("--submission", help="request: path of the CSV for the TSM "
+                                         "(default <out stem>_deid_submission.csv)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     if a.cmd == "manifest":
@@ -224,7 +244,7 @@ def main(argv=None):
     cfg = StudyConfig.load(a.config)
     be = SparkBackend(SparkSession.builder.getOrCreate())
     if a.cmd == "request":
-        build_dicom_request(be, cfg, a.out)
+        build_dicom_request(be, cfg, a.out, submission_csv=a.submission)
     else:
         extract_ecg_table(be, cfg, a.out)
 
