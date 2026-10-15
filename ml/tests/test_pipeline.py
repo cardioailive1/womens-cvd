@@ -184,6 +184,13 @@ def test_train_export_serve(study, tmp_path):
     summ = pretrain.main(["--config", str(cfg_path), "--pool-dir", str(study["tmp"] / "pool"),
                           "--out", str(pre_dir), "--size", "small", "--epochs", "1", "--workers", "0"])
     assert summ["stages_done"] == ["ecg", "echo", "ehr", "labs"]
+    # --resume on a finished pre-training run keeps every stage and reproduces the same encoders
+    before = torch.load(pre_dir / "encoders.pt")
+    summ2 = pretrain.main(["--config", str(cfg_path), "--pool-dir", str(study["tmp"] / "pool"),
+                           "--out", str(pre_dir), "--size", "small", "--epochs", "1", "--workers", "0", "--resume"])
+    after = torch.load(pre_dir / "encoders.pt")
+    assert summ2["stages_done"] == summ["stages_done"]
+    assert all(torch.equal(before[k], after[k]) for k in before)
     run = tmp_path / "run"
     best = train.main(["--config", str(cfg_path), "--study-dir", str(study["tmp"] / "tables"),
                        "--out", str(run), "--size", "small", "--epochs", "3", "--batch-size", "16",
@@ -193,6 +200,16 @@ def test_train_export_serve(study, tmp_path):
                        "--init-weights", str(pre_dir / "encoders.pt"),
                        "--preprocessors", str(pre_dir / "preprocessors.pkl")])
     assert best >= 0
+    # an interrupted run continues from its last epoch: 3 epochs done, resume to 4
+    import json as _json
+    train.main(["--config", str(cfg_path), "--study-dir", str(study["tmp"] / "tables"),
+                "--out", str(run), "--size", "small", "--epochs", "4", "--batch-size", "16",
+                "--warmup", "10", "--workers", "0", "--n-boot", "20", "--patience", "50",
+                "--report-dir", str(tmp_path / "reports"), "--grad-accum", "2",
+                "--init-weights", str(pre_dir / "encoders.pt"),
+                "--preprocessors", str(pre_dir / "preprocessors.pkl"), "--resume"])
+    hist = _json.loads((tmp_path / "reports" / "12_training_summary.json").read_text())["history"]
+    assert [h["epoch"] for h in hist] == [0, 1, 2, 3]                 # resumed, not restarted
     metrics = pd.read_csv(tmp_path / "reports" / "10_test_metrics.csv")
     assert set(C.CONDITION_ORDER) <= set(metrics.task)
     summary = json.loads((tmp_path / "reports" / "12_training_summary.json").read_text())

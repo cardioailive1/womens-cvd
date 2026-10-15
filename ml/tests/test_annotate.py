@@ -166,15 +166,17 @@ def test_phenotype_review(tmp_path):
     con.execute("CREATE TABLE omop_cdm.note AS SELECT person_id, condition_start_date AS note_date, "
                 "'Cardiology consult' AS note_title, 'Spontaneous dissection of the LAD, no instrumentation.' AS note_text "
                 "FROM omop_cdm.condition_occurrence LIMIT 200")
-    con.execute("CREATE TABLE fact_echo_test AS SELECT person_id AS pid, condition_start_date AS echo_date, "
+    con.execute("CREATE TABLE fact_echo_test AS SELECT 'MC' || lpad(CAST(person_id AS VARCHAR), 7, '0') "
+                "AS patient_clinic_number, condition_start_date AS echo_date, "
                 "'LVEF 30%. Apical ballooning.' AS echo_note FROM omop_cdm.condition_occurrence LIMIT 300")
     be = DuckDBBackend(con)
     cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", report_dir=str(tmp_path / "rep"),
                            imaging_required=False)
     assert cfg.report_sources["echo_notes"]["text_column"] == "ECHO_NOTE"
-    cfg.report_sources = {
-        "echo_notes": {"table": "fact_echo_test", "person_column": "pid", "date_column": "echo_date",
-                       "text_column": "echo_note"},
+    assert "radiology" not in cfg.report_sources                 # off: radiology reports are in OMOP NOTE
+    cfg.report_sources = {                       # Mayo-native key, mapped through person_source_value
+        "echo_notes": {"table": "fact_echo_test", "person_column": "patient_clinic_number",
+                       "person_key": "clinic_number", "date_column": "echo_date", "text_column": "echo_note"},
         "radiology": {"table": "FACT_RADIOLOGY", "text_column": None, "person_column": None, "date_column": None}}
     t = build_study(be, cfg, tmp_path / "study")
     assert (tmp_path / "study" / "code_events.pkl").exists()

@@ -69,6 +69,8 @@ def main(argv=None):
     ap.add_argument("--warmup", type=int, default=500); ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--no-imaging", action="store_true", help="skip ECG/echo loading (EHR-only ablation)")
     ap.add_argument("--n-boot", type=int, default=1000)
+    ap.add_argument("--resume", action="store_true",
+                    help="continue an interrupted run in the same --out folder from its last finished epoch")
     ap.add_argument("--report-dir", help="where reports 10-12 go (default: privacy.report_dir); "
                                          "use one folder per run so runs do not overwrite each other")
     ap.add_argument("--site-adv-weight", type=float, default=0.1,
@@ -125,9 +127,19 @@ def main(argv=None):
     use_amp = dev == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     w = LossWeights(site_adv=a.site_adv_weight, fair=a.fair_weight)
-    best, bad, step, history = -1.0, 0, 0, []
+    best, bad, step, history, start, stopped = -1.0, 0, 0, [], 0, False
+    last = out / "last.pt"
+    if a.resume and last.exists():
+        ck = torch.load(last, map_location=dev, weights_only=False)
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"]); scaler.load_state_dict(ck["scaler"])
+        best, bad, step, history, stopped = ck["best"], ck["bad"], ck["step"], ck["history"], ck["stopped"]
+        start = ck["epoch"] + 1
+        log.info("resuming after epoch %d (best val macro-AUROC %.4f)", ck["epoch"], best)
 
-    for epoch in range(a.epochs):
+    for epoch in range(start, a.epochs):
+        if stopped:
+            break
         model.set_imaging_frozen(epoch < cfg.freeze_imaging_backbones_epochs)
         model.train(); losses = []
         opt.zero_grad(set_to_none=True)
@@ -157,8 +169,14 @@ def main(argv=None):
             data.pre.save(out / "preprocessors.pkl")
         else:
             bad += 1
-            if bad >= a.patience:
-                log.info("early stop at epoch %d", epoch); break
+            stopped = bad >= a.patience
+        tmp = last.with_suffix(".tmp")      # saved every epoch so a lost GPU session costs at most one
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "scaler": scaler.state_dict(), "epoch": epoch, "best": best, "bad": bad, "step": step,
+                    "history": history, "stopped": stopped}, tmp)
+        tmp.replace(last)
+        if stopped:
+            log.info("early stop at epoch %d", epoch)
 
     ck = torch.load(out / "hcman_best.pt", map_location=dev)
     model.load_state_dict(ck["state_dict"])
