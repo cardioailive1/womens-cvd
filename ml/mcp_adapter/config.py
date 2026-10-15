@@ -22,6 +22,9 @@ class StudyConfig:
     vocab_schema: str = "omop_cdm"
     results_schema: str | None = None
     imaging_required: bool = True
+    dicom_inventory: dict = field(default_factory=dict)
+    person_map: dict = field(default_factory=dict)
+    ecg_table: dict = field(default_factory=dict)
     ecg_source: SourceConfig = field(default_factory=SourceConfig)
     echo_source: SourceConfig = field(default_factory=SourceConfig)
 
@@ -74,6 +77,9 @@ class StudyConfig:
             vocab_schema=p.get("vocab_schema", p.get("cdm_schema", "omop_cdm")),
             results_schema=p.get("results_schema"),
             imaging_required=p.get("imaging_required", True),
+            dicom_inventory=p.get("dicom_inventory") or {},
+            person_map=p.get("person_map") or {},
+            ecg_table=p.get("ecg_table") or {},
             ecg_source=SourceConfig(**(p.get("ecg_source") or {})),
             echo_source=SourceConfig(**(p.get("echo_source") or {})),
             study_start=s.get("study_start", "2010-01-01"),
@@ -104,7 +110,8 @@ class StudyConfig:
             freeze_imaging_backbones_epochs=m.get("freeze_imaging_backbones_epochs", 5),
         )
         cfg.pretrain.update(pt)
-        cfg.report_sources = {k: v for k, v in (raw.get("reports") or {}).items() if v}
+        cfg.report_sources = {k: v for k, v in (raw.get("reports") or {}).items()
+                              if v and v.get("enabled", True)}
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg

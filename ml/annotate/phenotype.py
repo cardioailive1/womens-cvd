@@ -125,10 +125,16 @@ def report_notes(be: Backend, cfg: StudyConfig, name: str, src: dict, lo: int, h
         return empty
     d = days_between(cfg.dialect, f"r.{src['date_column']}", "w.index_date")
     try:
+        if src.get("person_key", "person_id") == "clinic_number":     # Mayo-native patient key
+            from mcp_adapter.imaging_sources import person_join
+            join = (f"{person_join(cfg, 'pm', 'r.' + src['person_column'])} "
+                    f"JOIN {REVIEW_VIEW} w ON w.person_id = pm.person_id")
+            pid = "pm.person_id"
+        else:
+            join, pid = f"JOIN {REVIEW_VIEW} w ON w.person_id = r.{src['person_column']}", f"r.{src['person_column']}"
         return be.sql(f"""
-SELECT r.{src['person_column']} AS person_id, {d} AS rel_day, '{name}' AS title,
-       r.{src['text_column']} AS text
-FROM {src['table']} r JOIN {REVIEW_VIEW} w ON w.person_id = r.{src['person_column']}
+SELECT {pid} AS person_id, {d} AS rel_day, '{name}' AS title, r.{src['text_column']} AS text
+FROM {src['table']} r {join}
 WHERE {d} BETWEEN {lo} AND {hi}""")
     except Exception as e:
         import logging

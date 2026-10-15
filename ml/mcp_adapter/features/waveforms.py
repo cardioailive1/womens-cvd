@@ -48,7 +48,18 @@ def preprocess_ecg(x: np.ndarray, fs: int = FS) -> np.ndarray:
 def read_muse_xml(path: str | Path) -> tuple[np.ndarray, int]:
     """GE MUSE XML 'Rhythm' waveform -> (12, n) mV. MUSE stores I, II, V1–V6; the four limb
     leads III, aVR, aVL, aVF are derived (Einthoven / Goldberger)."""
-    root = ET.parse(path).getroot()
+    return parse_muse_xml(ET.parse(path).getroot())
+
+
+def parse_muse_xml(root_or_text) -> tuple[np.ndarray, int]:
+    """Same as read_muse_xml, from an XML string (or base64 of one) or a parsed root element —
+    for ECGs stored as encoded strings in a table."""
+    root = root_or_text
+    if isinstance(root_or_text, (str, bytes)):
+        text = root_or_text.decode() if isinstance(root_or_text, bytes) else root_or_text
+        if not text.lstrip().startswith("<"):
+            text = base64.b64decode(text).decode("utf-8", errors="replace")
+        root = ET.fromstring(text)
     for wf in root.iter("Waveform"):
         if (wf.findtext("WaveformType") or "").strip() != "Rhythm":
             continue
@@ -66,7 +77,19 @@ def read_muse_xml(path: str | Path) -> tuple[np.ndarray, int]:
         leads.setdefault("aVF", II - I / 2)
         n = min(len(v) for v in leads.values())
         return np.stack([leads[l][:n] for l in LEADS]), fs
-    raise ValueError(f"no Rhythm waveform in {path}")
+    raise ValueError("no Rhythm waveform in the MUSE XML")
+
+
+def leads_from_base64(lead_ids, payloads, units_per_bit: float = 4.88) -> np.ndarray:
+    """Per-lead base64 int16 strings (MUSE-style WaveFormData) -> (12, n) mV, deriving missing
+    limb leads from I and II."""
+    leads = {str(l).strip(): np.frombuffer(base64.b64decode(p), dtype="<i2").astype(np.float64)
+             * units_per_bit / 1000.0 for l, p in zip(lead_ids, payloads)}
+    I, II = leads["I"], leads["II"]
+    leads.setdefault("III", II - I); leads.setdefault("aVR", -(I + II) / 2)
+    leads.setdefault("aVL", I - II / 2); leads.setdefault("aVF", II - I / 2)
+    n = min(len(v) for v in leads.values())
+    return np.stack([leads[l][:n] for l in LEADS])
 
 
 def read_dicom_ecg(path: str | Path) -> tuple[np.ndarray, int]:
@@ -89,6 +112,9 @@ def read_dicom_ecg(path: str | Path) -> tuple[np.ndarray, int]:
 
 
 def load_ecg(path: str, kind: str) -> np.ndarray:
+    if str(path).endswith(".npz"):            # extracted from an ECG table: raw mV + sampling rate
+        d = np.load(path)
+        return preprocess_ecg(d["x"], int(d["fs"]))
     if kind == "npy_dir":
         arr = np.load(path)
         return preprocess_ecg(arr if arr.shape[0] == 12 else arr.T)

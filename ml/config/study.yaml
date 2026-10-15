@@ -10,6 +10,47 @@ platform:
   # study (imaging_required: true). Fill in where MCP exposes it — ask the MCP mentor for the
   # table or bucket names; the rest of the pipeline does not change.
   imaging_required: true
+  # DICOM files are not in a table: each instance is catalogued in FACT_RADIOLOGY_DICOM_INVENTORY
+  # and must be requested (MCP, 15 Oct 2026). Column names below are from the MCP Radiology deck.
+  # `python -m mcp_adapter.imaging_sources request` builds the study-level request list.
+  dicom_inventory:
+    table: FACT_RADIOLOGY_DICOM_INVENTORY   # TODO(MCP): add the schema prefix if needed
+    patient_column: PATIENT_CLINIC_NUMBER   # Mayo clinic number, mapped to OMOP via person_map below
+    study_uid_column: STUDY_INSTANCE_UID
+    series_uid_column: SERIES_INSTANCE_UID
+    accession_column: DICOM_ACCESSION_NUMBER   # = FACT_RADIOLOGY.ACCESSION_NBR
+    modality_column: MODALITY
+    stmo_column: STMO_NAME_IN_ADL           # storage segment; part of the join key to other tables
+    description_column: STUDY_DESCRIPTION
+    deid_status_column: IMAGE_DEID_STATUS
+    deid_ok: [Ready, Available]             # only these can be submitted for de-identification
+    modalities: [US]                        # US = echo (also obstetric, vascular... filtered below)
+    description_pattern: "ECHO|TTE|TRANSTHORACIC|CARDIAC|HEART"
+    window_days: [-30, 2]                   # study date relative to a cardiac evaluation
+    keep_undated: true                      # echo is itself a cardiac evaluation: keep studies
+                                            #   whose date cannot be found rather than drop them
+    # The inventory has no study date. Take it from FACT_RADIOLOGY via the accession number
+    # (radiology-read studies); echo studies without a radiology report stay undated.
+    date_source: fact_radiology             # fact_radiology | inventory | none
+    date_table: FACT_RADIOLOGY              # TODO(MCP): add the schema prefix if needed
+    date_accession_column: ACCESSION_NBR
+    date_column: RADIOLOGY_DTM              # when the imaging was performed (not RADIOLOGY_REVIEW_DTM)
+  # Mayo-native tables key patients by PATIENT_CLINIC_NUMBER; OMOP uses person_id. This is the
+  # OMOP person column holding the (de-identified) clinic number.
+  person_map:
+    clinic_number_column: person_source_value   # TODO(MCP): confirm this mapping
+  # Only if ECG waveforms are stored as encoded strings in a table (to confirm with MCP).
+  # `python -m mcp_adapter.imaging_sources ecg` converts them to files + a manifest.
+  ecg_table:
+    table: null                  # TODO(MCP)
+    format: muse_xml             # muse_xml (one row per ECG, XML text or base64 of it) | lead_base64
+    person_column: null
+    date_column: null
+    id_column: null              # one ECG
+    waveform_column: null
+    lead_column: null            # lead_base64 only
+    sample_rate: 500             # lead_base64 only, unless sample_rate_column is set
+    units_per_bit: 4.88          # lead_base64 only (microvolts per stored unit)
   ecg_source:
     kind: muse_xml_dir           # muse_xml_dir | dicom_ecg | npy_dir
     path: null                   # TODO(MCP): root folder of ECG files (manifest paths are relative to it)
@@ -38,19 +79,22 @@ study:
   condition_label_rule: two_codes_or_inpatient   # two_codes_or_inpatient | any_code
 
 reports:
-  # Free-text clinical reports for chart review (runbook Step 4b). These are Mayo-native tables,
-  # outside OMOP (per MCP, 14 Oct 2026). Fill the TODO(MCP) columns after the MCP data training;
-  # person_column must hold the same patient key as OMOP person_id, or the source is skipped.
+  # Free-text clinical reports for chart review (runbook Step 4b). Radiology reports are already
+  # in the OMOP NOTE table (MCP Radiology deck), which chart review reads by default, so the
+  # FACT_RADIOLOGY source is off to avoid showing each report twice. Echo notes are Mayo-native.
   echo_notes:
     table: FACT_ECHO_TEST          # TODO(MCP): add the schema prefix if needed
     text_column: ECHO_NOTE         # MCP: "Echo Notes are in FACT_ECHO_TEST.ECHO_NOTE"
-    person_column: null            # TODO(MCP)
-    date_column: null              # TODO(MCP)
+    person_column: PATIENT_CLINIC_NUMBER   # TODO(MCP): confirm (the Mayo-native patient key)
+    person_key: clinic_number      # clinic_number (mapped via platform.person_map) | person_id
+    date_column: null              # TODO(MCP): echo date column
   radiology:
-    table: FACT_RADIOLOGY          # TODO(MCP): add the schema prefix if needed
-    text_column: null              # TODO(MCP): report text column
-    person_column: null            # TODO(MCP)
-    date_column: null              # TODO(MCP)
+    enabled: false                 # already in OMOP NOTE; turn on only if NOTE lacks them
+    table: FACT_RADIOLOGY
+    text_column: RADIOLOGY_REPORT
+    person_column: PATIENT_CLINIC_NUMBER   # TODO(MCP): confirm
+    person_key: clinic_number
+    date_column: RADIOLOGY_DTM
 
 sampling:
   # Minimum targets from the Model Details Form; the feasibility query decides real N.

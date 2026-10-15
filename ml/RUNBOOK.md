@@ -1,6 +1,6 @@
 # HCMAN Training Runbook — Mayo Clinic Platform
 
-Last updated: Oct 14, 2026 (MCP answers of 14 Oct folded in)
+Last updated: Oct 15, 2026 (MCP answers of 14 and 15 Oct folded in)
 
 This runbook takes HCMAN from an empty Mayo Clinic Platform workbench to a trained, reviewed model the CardioAI app can call. It is the first training of the model: every encoder is pre-trained from scratch inside the platform, and ECG and echo imaging are required. All commands run from the `ml/` folder of the repository's `main` branch.
 
@@ -32,12 +32,11 @@ You need seven things in place before any code runs in the workbench; the code-r
 | --- | --- | --- |
 | Platform access | Approved Accelerate workspace, onboarding done, your user on the project | Mayo Clinic Platform |
 | Code approval | The repository (`ml/` folder, `main` branch) reviewed and whitelisted | Mayo Clinic Platform code review |
-| Imaging locations | Table or folder for 12-lead ECGs and for echo DICOM cine, the person key that links them to OMOP, and whether echo clips carry view labels | MCP technical mentor |
-| Compute | JupyterLab or VS Code workspace on one of MCP's shared-reservation A100 40 GB machines (confirmed); other machine types on request. Settings below are sized for 40 GB | Mayo Clinic Platform |
+| Compute | A shared-reservation A100 40 GB machine (confirmed); other machine types on request. There is no booking: turn the GPU workspace on and a machine is assigned when one is free. Because the pool is shared, long runs save a checkpoint every epoch and continue with `--resume` | Mayo Clinic Platform |
 | Export rules | The official small-cell threshold and the approval path for aggregate reports and model weights | Mayo Clinic Platform |
 | Clinical sign-off | Cardiologist review of the code lists in `ml/mcp_adapter/concepts.py` | Cardio AI clinical lead |
-| Annotators | Up to 5 extra workspace seats for outside readers (confirmed). Mayo Clinic staff cannot annotate in your environment, so hire cardiologists or sonographers; each needs a `cardioailive.com` email | Cardio AI, then MCP to issue seats |
-| Imaging location | Where the echo and ECG DICOM files sit (table names and storage). Still open after the 14 Oct answers; MCP will cover it in the data training sessions | MCP technical mentor |
+| Annotators | Up to 5 extra workspace seats for outside readers (confirmed). Mayo Clinic staff cannot annotate in your environment, so hire cardiologists or sonographers; each needs a `cardioailive.com` email and goes through the same onboarding as every data user, including a [DUA form submission](https://app.smartsheet.com/b/form/019a16c42ac777d8880713d7e7e8b8ff) | Cardio AI, then MCP to issue seats |
+| Imaging data | DICOM files are not in a table: every instance is catalogued in `FACT_RADIOLOGY_DICOM_INVENTORY` and must be requested (confirmed; columns from the MCP Radiology deck are already in `config/study.yaml`). Still needed: the request process and where delivered files land; that OMOP `person.person_source_value` holds the `PATIENT_CLINIC_NUMBER`; the date and patient columns of `FACT_ECHO_TEST`; and whether ECG waveforms are DICOM files or encoded strings in a table | MCP technical mentor |
 
 **Roles for the run:**
 
@@ -45,7 +44,7 @@ You need seven things in place before any code runs in the workbench; the code-r
 - **Clinical reviewers** — sign off code lists (Step 2), label echo clips (Step 2b, a sonographer or cardiologist), review records against the automatic labels (Step 4b, a cardiologist) and read the label prevalence report (Step 4). They must be outside readers on Cardio AI's annotator seats; Mayo staff cannot do this work.
 - **Approver** — decides go / no-go at the three gates (Steps 3–4) and accepts the model (Step 7).
 
-**What MCP confirmed (14 Oct 2026):** `pip install` works in the workspace; local web apps can run on localhost; Docker containers run but cannot pull images, so they must be self-contained; a remote desktop with 3D Slicer and ITK-SNAP is already installed. There are no existing image annotations on the platform; labels come from radiology reports and echo notes. Public datasets should stay outside the environment unless essential.
+**What MCP confirmed (14-15 Oct 2026):** `pip install` works in the workspace; local web apps can run on localhost; Docker containers run but cannot pull images, so they must be self-contained; a remote desktop with 3D Slicer and ITK-SNAP is already installed. There are no existing image annotations on the platform; labels come from radiology reports and echo notes. Public datasets should stay outside the environment unless essential. DICOM images are requested through `FACT_RADIOLOGY_DICOM_INVENTORY`. A self-contained Docker image saved as a tar file is imported the same way as other files. GPUs are assigned automatically when available. From the Radiology deck: the inventory has one row per DICOM instance, keyed by `PATIENT_CLINIC_NUMBER` and `STUDY_INSTANCE_UID`; only instances with `IMAGE_DEID_STATUS` Ready or Available can be requested; images link to reports through `DICOM_ACCESSION_NUMBER` = `FACT_RADIOLOGY.ACCESSION_NBR`; radiology reports are also in the OMOP `note` table; the inventory itself is not in OMOP.
 
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
 
@@ -80,7 +79,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (32 at the time of writing). It takes about 12 minutes on CPU, less on GPU.
+   Expect every test to pass (37 at the time of writing). It takes about 12 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -95,10 +94,33 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
      cdm_schema: <schema with person etc.>
      vocab_schema: <schema with concept>
    ```
-2. **ECG source.** Set `kind` to `muse_xml_dir` (GE MUSE XML) or `dicom_ecg` (DICOM waveforms). Set `manifest` to the table MCP gives you, written `sql:<schema.table>`, or to a CSV/Parquet file. The manifest needs columns `person_id`, `record_date`, `path`. If paths are relative, set `path` to their root folder.
-3. **Echo source.** Same for echo with `kind: dicom_dir`. The manifest needs `person_id`, `record_date`, `path` and `view` (one of PLAX, PSAX, A4C, A2C); `ed_frame` and `es_frame` are optional. If MCP's table uses other column names, create a view that renames them rather than editing the code.
-4. **Clinical sign-off.** The clinical reviewer checks every code list in `mcp_adapter/concepts.py` and records approval in the run checklist.
-5. **Check the wiring** in a notebook (the MCP notebook provides the Spark session as `spark`):
+2. **Request the imaging.** DICOM files must be requested from `FACT_RADIOLOGY_DICOM_INVENTORY` before they can be read. The inventory's columns are already set in `config/study.yaml` from the MCP Radiology deck; confirm two things first: the table's schema prefix, and that `person.person_source_value` holds `PATIENT_CLINIC_NUMBER` (`platform.person_map`), which is how inventory rows are matched to OMOP patients. Then build the request list:
+
+   - instances whose `IMAGE_DEID_STATUS` is Ready or Available (the only ones that can be de-identified);
+   - modality `US` with a cardiac study description (echo; obstetric and vascular ultrasound are left out);
+   - for women with a cardiac evaluation, grouped into studies;
+   - dated from `FACT_RADIOLOGY.RADIOLOGY_DTM` through the accession number and kept when within −30 to +2 days of an evaluation. Echo studies with no radiology report have no date there; they are kept, since an echo is itself a cardiac evaluation, and dated from the DICOM header once delivered (set `keep_undated: false` to drop them).
+
+   ```bash
+   python -m mcp_adapter.imaging_sources request --config config/study.yaml --out $WB/imaging/dicom_request.csv
+   ```
+
+   Check `reports/00_dicom_request.csv` for the number of studies (and how many are dated), women and instances, then submit the list (one row per `STUDY_INSTANCE_UID`) through MCP's request process. When the files are delivered, link each one back to its woman and date:
+
+   ```bash
+   python -m mcp_adapter.imaging_sources manifest --config config/study.yaml \
+       --files <delivered folder> --request $WB/imaging/dicom_request.csv --out $WB/imaging/echo_manifest.csv
+   ```
+
+   **ECGs:** if the 12-lead ECGs are inventoried as DICOM, add `ECG` to `dicom_inventory.modalities` and build their manifest the same way with `--modality ECG`. If they are stored as encoded strings in a table, fill `ecg_table:` instead and convert them once to files plus a manifest:
+
+   ```bash
+   python -m mcp_adapter.imaging_sources ecg --config config/study.yaml --out $WB/imaging/ecg
+   ```
+3. **ECG source.** Set `ecg_source.manifest` to the ECG manifest from item 2 and `ecg_source.path` to `null` (its paths are complete). Set `kind` to `muse_xml_dir` for GE MUSE XML files or `dicom_ecg` for DICOM waveforms; files converted from a table are recognised whatever the `kind`. A manifest can also be a platform table, written `sql:<schema.table>`; it needs columns `person_id`, `record_date` and `path`.
+4. **Echo source.** Set `echo_source.manifest` to `$WB/imaging/echo_manifest.csv`, `echo_source.path` to `null` and `kind` to `dicom_dir`. The manifest needs `person_id`, `record_date` and `path`; the `view` column (and optional `ed_frame`, `es_frame`) is added in Step 2b.
+5. **Clinical sign-off.** The clinical reviewer checks every code list in `mcp_adapter/concepts.py` and records approval in the run checklist.
+6. **Check the wiring** in a notebook (the MCP notebook provides the Spark session as `spark`):
 
    ```python
    import sys; sys.path.insert(0, ".")
@@ -280,6 +302,8 @@ Goal: every encoder learns from Mayo data without labels before it sees the coho
    tail -f $WB/pretrain.log
    ```
 
+   If the GPU session ends part-way, run the same command again with `--resume`: finished stages are kept and the unfinished one continues from its last completed epoch.
+
    Stages can also run one at a time, for example on separate GPUs in separate sessions, with `--stages ecg`, `--stages echo`, `--stages ehr,labs` and different `--out` folders; merge them afterwards (Troubleshooting).
 4. **Check the result.** `$WB/pretrain/` holds `encoders.pt` and `preprocessors.pkl`; `reports/08_pretraining_summary.json` lists the stages done and the loss per epoch.
 
@@ -307,7 +331,7 @@ Goal: the full HCMAN, starting from the pre-trained encoders, trained on the coh
    ```
 
    `--batch-size 8 --grad-accum 4` keeps the form's effective batch of 32 while fitting a 40 GB A100; on a larger GPU use `--batch-size 32 --grad-accum 1`. Add `--site-adv-weight 0` if gate 3 failed. Always pass both `--init-weights` and `--preprocessors` from the same pre-training run; the script refuses one without the other, because token ids must match.
-3. **Watch the log** (`tail -f $WB/run_full.log`). Each epoch prints training loss and validation macro-AUROC across the six conditions. Training stops after 15 epochs without improvement (max 100); the best epoch is saved as `hcman_best.pt`.
+3. **Watch the log** (`tail -f $WB/run_full.log`). A checkpoint is saved after every epoch; if the GPU session ends, run the same command again with `--resume`. Each epoch prints training loss and validation macro-AUROC across the six conditions. Training stops after 15 epochs without improvement (max 100); the best epoch is saved as `hcman_best.pt`.
 
 Settings come from the Model Details Form: AdamW at 1e-4 / 3e-4 / 5e-4 (encoders / fusion / heads), batch 32, 500-step warmup then cosine, FP16, gradient clipping 1.0. ECG and echo encoders stay frozen for the first 5 epochs (`model.freeze_imaging_backbones_epochs`).
 
@@ -381,6 +405,10 @@ Known gap: the app does not yet send ECG, echo, diagnosis history or medications
 | The review tool prints text instead of showing widgets | `ipywidgets` installed after JupyterLab started | Restart the JupyterLab kernel (or the server) after `pip install`; if it persists, ask MCP |
 | A lab is missing from report 01b | Mayo maps that test to a LOINC not in `concepts.py` | Find the LOINC in the Mayo Clinic Laboratories catalog and add it |
 | `train-views` says it needs more labelled clips per view | Seed set too small or missing a view | Keep labelling in the review queue until every view has at least 5 (aim for 100) |
+| A run stopped when the GPU session ended | Shared GPU pool | Turn the workspace back on and run the same command with `--resume`; it continues from the last finished epoch (pre-training: the last finished stage and epoch) |
+| `imaging_sources` says to set a `dicom_inventory`, `person_map` or `ecg_table` setting | Setting still empty | Fill it in `config/study.yaml` (inventory columns come from the MCP Radiology deck), then re-run |
+| The request list or echo-note review finds almost no women | `person.person_source_value` does not hold the clinic number | Ask MCP which OMOP column (or mapping table) links `PATIENT_CLINIC_NUMBER` to `person_id` and set `platform.person_map.clinic_number_column` |
+| The manifest links few delivered files | Files' StudyInstanceUID differs from the request list's ID column | Check which inventory column the request form uses and set `study_uid_column` to the one that matches the DICOM StudyInstanceUID |
 | CUDA out of memory | Batch too large for the GPU | Pre-training: lower `pretraining.batch_size` to 32. Fine-tuning: `--batch-size 4 --grad-accum 8` (same effective batch) |
 | A pre-training loss never falls | Inputs failed to load (zeros) or learning rate too high for that stage | Run Step 2's load check on 20 records from that stage's manifest; check the log for load errors |
 | `init weights do not match this model size` | Pre-training and fine-tuning used different `--size` | Use the same size (default `full`) for both |
@@ -406,9 +434,10 @@ Tick each item as it is done; write the run folder names and decisions next to t
 **Before you start**
 
 - [ ] Workspace approved and A100 40 GB reservation confirmed
-- [ ] Outside annotators hired; up to 5 seats issued with `cardioailive.com` accounts
+- [ ] Outside annotators hired; up to 5 seats issued with `cardioailive.com` accounts; each annotator's DUA form submitted
 - [ ] `ml/` code reviewed and whitelisted by MCP
-- [ ] ECG and echo DICOM locations and person key received from the MCP mentor (still open)
+- [ ] Radiology training done: request process known; clinic-number mapping confirmed; `FACT_ECHO_TEST` date and patient columns set; ECG storage format known
+- [ ] DICOM request list submitted (report 00); files delivered; echo (and ECG) manifests built
 - [ ] Report table columns filled under `reports:` in `config/study.yaml`
 - [ ] Official small-cell threshold and export path received
 

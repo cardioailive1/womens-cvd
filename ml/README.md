@@ -19,6 +19,7 @@ mcp_adapter/             OMOP CDM v5.4 -> HCMAN inputs (runs inside the MCP work
   features/waveforms.py  streams 1 and 2 (MUSE XML / npy ECG, DICOM echo)
   splits.py, privacy.py  patient-level splits; small-cell suppression for every report
   pipeline.py            run_feasibility(), build_study(), build_pretraining_pool()
+  imaging_sources.py     DICOM request list from the MCP inventory, manifests for delivered files, ECG-table extraction
 hcman/                   PyTorch model, pre-training, training, evaluation, export, serving
 annotate/                echo view + ED/ES auto-annotation, Jupyter review tool, chart review of labels
 tests/                   synthetic OMOP database + end-to-end tests

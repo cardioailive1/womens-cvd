@@ -126,12 +126,26 @@ def proj(d):  # SimCLR projection head (discarded after pre-training)
     return nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, 128))
 
 
-def _fit(params, loader, step_fn, epochs, lr, dev, name):
+def _save_atomic(obj, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp); tmp.replace(path)          # never leaves a half-written checkpoint
+
+
+def _fit(params, loader, step_fn, epochs, lr, dev, name, modules=(), ckpt: Path | None = None):
+    """Train one stage. With `ckpt`, state is saved after every epoch and picked up again if the
+    file exists, so a stage interrupted on a shared GPU continues where it stopped."""
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.01)
     total = max(1, epochs * len(loader)); s = 0
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda k: min(1.0, (k + 1) / 200) * 0.5 * (1 + math.cos(math.pi * min(k / total, 1))))
-    hist = []
-    for ep in range(epochs):
+    hist, start = [], 0
+    if ckpt is not None and ckpt.exists():
+        ck = torch.load(ckpt, map_location=dev)
+        for m, sd in zip(modules, ck["modules"]):
+            m.load_state_dict(sd)
+        opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
+        hist, start = ck["hist"], ck["epoch"] + 1
+        log.info("%s: resuming at epoch %d of %d", name, start, epochs)
+    for ep in range(start, epochs):
         losses = []
         for batch in loader:
             loss = step_fn(batch)
@@ -142,6 +156,9 @@ def _fit(params, loader, step_fn, epochs, lr, dev, name):
             losses.append(float(loss.detach()))
         m = float(np.mean(losses)) if losses else float("nan")
         hist.append(m); log.info("%s epoch %d loss %.4f", name, ep, m)
+        if ckpt is not None:
+            _save_atomic({"modules": [x.state_dict() for x in modules], "opt": opt.state_dict(),
+                          "sched": sched.state_dict(), "hist": hist, "epoch": ep}, ckpt)
     return hist
 
 
@@ -151,6 +168,9 @@ def main(argv=None):
     ap.add_argument("--out", required=True); ap.add_argument("--size", choices=["full", "small"])
     ap.add_argument("--stages", default="ecg,echo,ehr,labs"); ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--epochs", type=int, help="override every stage's epochs (smoke tests)")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue an interrupted run in the same --out folder: finished stages are "
+                         "kept, an unfinished stage restarts from its last completed epoch")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     cfg = StudyConfig.load(a.config); P = cfg.pretrain
@@ -161,27 +181,52 @@ def main(argv=None):
     t = {n: pd.read_pickle(d / f"{n}.pkl") for n in ("pool", "measurements", "ehr_tokens", "ecg_records", "echo_records")}
     ids = t["pool"].person_id.tolist()
 
-    pre = Preprocessors(ehr=EHRTokenizer(lookback_days=cfg.lookback_days).fit(t["ehr_tokens"], t["measurements"], ids),
-                        labs=LabEncoder(window_days=cfg.labs_window_days).fit(t["measurements"], ids), sites=[])
-    pre.save(out / "preprocessors.pkl")
+    if a.resume and (out / "preprocessors.pkl").exists():
+        pre = Preprocessors.load(out / "preprocessors.pkl")
+    else:
+        pre = Preprocessors(ehr=EHRTokenizer(lookback_days=cfg.lookback_days).fit(t["ehr_tokens"], t["measurements"], ids),
+                            labs=LabEncoder(window_days=cfg.labs_window_days).fit(t["measurements"], ids), sites=[])
+        pre.save(out / "preprocessors.pkl")
     size = a.size or cfg.model_size
     mc = (HCMANConfig.small if size == "small" else HCMANConfig)(ehr_vocab=pre.ehr.vocab_size)
     bs = P["batch_size"]; ep = lambda k: a.epochs if a.epochs is not None else P[k]
     kw = dict(num_workers=a.workers, drop_last=False)
     stages = set(a.stages.split(","))
     state, summary = {}, {"pool_women": len(ids), "model_size": size}
+    ckdir = out / "checkpoints"; ckdir.mkdir(exist_ok=True)
 
-    if "ecg" in stages and len(t["ecg_records"]):
+    def done(stage: str) -> bool:
+        """On --resume, a finished stage is loaded from disk instead of being trained again."""
+        f = ckdir / f"stage_{stage}.pt"
+        if a.resume and f.exists():
+            ck = torch.load(f, map_location="cpu")
+            state.update(ck["state"]); summary[f"{stage}_loss"] = ck["hist"]
+            log.info("%s: already finished, kept", stage)
+            return True
+        return False
+
+    def finish(stage: str, sd: dict, hist) -> None:
+        part = {k: v.cpu() for k, v in sd.items()}
+        state.update(part); summary[f"{stage}_loss"] = hist
+        _save_atomic({"state": part, "hist": hist}, ckdir / f"stage_{stage}.pt")
+        (ckdir / f"epochs_{stage}.pt").unlink(missing_ok=True)
+
+    if not a.resume:
+        for f in ckdir.glob("*.pt"):
+            f.unlink()
+
+    if "ecg" in stages and len(t["ecg_records"]) and not done("ecg"):
         enc, head = ECGTransformer(mc).to(dev), proj(mc.ecg_dim).to(dev)
         dl = DataLoader(ECGSet(t["ecg_records"], cfg.ecg_source.kind), batch_size=bs, shuffle=True, collate_fn=ok_collate, **kw)
         def step(x):
             if len(x) < 2: return None
             x = x.to(dev)
             return nt_xent(head(enc(aug_ecg(x))[:, 0]), head(enc(aug_ecg(x))[:, 0]))
-        summary["ecg_loss"] = _fit(list(enc.parameters()) + list(head.parameters()), dl, step, ep("ecg_epochs"), 3e-4, dev, "ecg")
-        state.update({f"ecg.{k}": v.cpu() for k, v in enc.state_dict().items()})
+        h = _fit(list(enc.parameters()) + list(head.parameters()), dl, step, ep("ecg_epochs"), 3e-4, dev, "ecg",
+                 modules=(enc, head), ckpt=ckdir / "epochs_ecg.pt")
+        finish("ecg", {f"ecg.{k}": v for k, v in enc.state_dict().items()}, h)
 
-    if "echo" in stages and len(t["echo_records"]):
+    if "echo" in stages and len(t["echo_records"]) and not done("echo"):
         enc = EchoEncoder(mc).to(dev); head = proj(mc.echo_dim).to(dev)
         frame = lambda x: enc.fc(enc.backbone(x))
         dl = DataLoader(EchoFrameSet(t["echo_records"], mc.echo_frames), batch_size=bs, shuffle=True, collate_fn=ok_collate, **kw)
@@ -190,10 +235,11 @@ def main(argv=None):
             x = x.to(dev)
             return nt_xent(head(frame(aug_frame(x))), head(frame(aug_frame(x))))
         params = list(enc.backbone.parameters()) + list(enc.fc.parameters()) + list(head.parameters())
-        summary["echo_loss"] = _fit(params, dl, step, ep("echo_epochs"), 3e-4, dev, "echo")
-        state.update({f"echo.{k}": v.cpu() for k, v in enc.state_dict().items() if k.startswith(("backbone", "fc"))})
+        h = _fit(params, dl, step, ep("echo_epochs"), 3e-4, dev, "echo", modules=(enc, head),
+                 ckpt=ckdir / "epochs_echo.pt")
+        finish("echo", {f"echo.{k}": v for k, v in enc.state_dict().items() if k.startswith(("backbone", "fc"))}, h)
 
-    if "ehr" in stages:
+    if "ehr" in stages and not done("ehr"):
         enc = CardioTransformer(mc).to(dev)
         seqs = list(pre.ehr.transform(t["ehr_tokens"], t["measurements"], ids).values())
         dl = DataLoader(SeqSet(seqs), batch_size=bs, shuffle=True, collate_fn=partial(pad_collate, width=4), **kw)
@@ -207,10 +253,11 @@ def main(argv=None):
             xm = x.clone(); xm[..., 0] = torch.where(sel, torch.full_like(x[..., 0], mask_id), x[..., 0])
             xm[..., 2] = torch.where(sel, torch.zeros_like(x[..., 2]), x[..., 2])
             return F.cross_entropy(enc.mlm(enc(xm, m))[sel], target)
-        summary["ehr_loss"] = _fit(list(enc.parameters()), dl, step, ep("ehr_epochs"), 1e-4, dev, "ehr")
-        state.update({f"ehr.{k}": v.cpu() for k, v in enc.state_dict().items()})
+        h = _fit(list(enc.parameters()), dl, step, ep("ehr_epochs"), 1e-4, dev, "ehr", modules=(enc,),
+                 ckpt=ckdir / "epochs_ehr.pt")
+        finish("ehr", {f"ehr.{k}": v for k, v in enc.state_dict().items()}, h)
 
-    if "labs" in stages:
+    if "labs" in stages and not done("labs"):
         enc = TemporalTransformer(mc).to(dev)
         seqs = [s for s in pre.labs.transform(t["measurements"], ids).values() if len(s) >= 2]
         if seqs:
@@ -223,8 +270,9 @@ def main(argv=None):
                 xm = x.clone(); xm[..., 1] = torch.where(sel, torch.zeros_like(x[..., 1]), x[..., 1])
                 tok, _ = enc(xm, m)
                 return F.mse_loss(enc.head(tok).squeeze(-1)[sel], target)
-            summary["labs_loss"] = _fit(list(enc.parameters()), dl, step, ep("labs_epochs"), 1e-4, dev, "labs")
-            state.update({f"labs.{k}": v.cpu() for k, v in enc.state_dict().items()})
+            h = _fit(list(enc.parameters()), dl, step, ep("labs_epochs"), 1e-4, dev, "labs", modules=(enc,),
+                     ckpt=ckdir / "epochs_labs.pt")
+            finish("labs", {f"labs.{k}": v for k, v in enc.state_dict().items()}, h)
 
     torch.save(state, out / "encoders.pt")
     summary["stages_done"] = sorted({k.split(".")[0] for k in state})

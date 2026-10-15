@@ -93,7 +93,7 @@ def build(seed: int = 7, n_women: int = 900, n_men: int = 60):
         yob = t0.year - age0
         race = int(rng.choice([8527, 8516, 8515, 0], p=[.7, .14, .08, .08]))
         site = sites[int(rng.integers(0, 3))][0]
-        people.append((pid, gender, yob, race, 0, site))
+        people.append((pid, gender, yob, race, 0, site, f"MC{pid:07d}"))  # de-identified clinic number
         obs.append((pid, base - pd.Timedelta(days=900), pd.Timestamp("2025-06-30")))
         for c in rng.choice(["I10", "E11.9", "E78.5", "F17.210", "J45.909"], int(rng.integers(0, 3)),
                             replace=False):
@@ -161,7 +161,7 @@ def build(seed: int = 7, n_women: int = 900, n_men: int = 60):
         "concept": D(concept, ["concept_id", "concept_name", "vocabulary_id", "concept_class_id", "concept_code"]),
         "concept_ancestor": D(anc, ["ancestor_concept_id", "descendant_concept_id"]),
         "person": D(people, ["person_id", "gender_concept_id", "year_of_birth", "race_concept_id",
-                             "ethnicity_concept_id", "care_site_id"]),
+                             "ethnicity_concept_id", "care_site_id", "person_source_value"]),
         "care_site": D(sites, ["care_site_id", "care_site_name"]),
         "observation_period": D(obs, ["person_id", "observation_period_start_date", "observation_period_end_date"]),
         "visit_occurrence": D(visits, ["visit_occurrence_id", "person_id", "visit_concept_id", "visit_start_date"]),
