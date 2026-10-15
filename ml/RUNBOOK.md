@@ -44,6 +44,8 @@ You need seven things in place before any code runs in the workbench; the code-r
 - **Data scientists (audit tier 1)** — label the echo seed set (Step 2b) and audit every automatic label, echo and condition alike (Steps 2b and 4b): agree, disagree with a correction, or mark uncertain.
 - **Cardiologist (audit tier 2)** — signs off code lists (Step 2), reads the label prevalence report (Step 4) and adjudicates, blinded, every disagreement, every uncertain item and a random spot-check of items tier 1 accepted (Steps 2b and 4b). Must be an outside reader on Cardio AI's annotator seats; Mayo staff cannot do this work.
 
+Optionally, an **automatic auditor** can do a first tier-1 pass (`audit.auto_tier1` in `config/study.yaml`). It checks each automatic label against evidence the labelling did not use: for conditions, the clinical and report notes (with negation and history cues), procedures (a catheterisation or PCI just before a coronary dissection code points to an iatrogenic dissection, not SCAD) and the LVEF stated in echo reports; for echo clips, the DICOM view name against a separately trained view model, and the labelled ED frame against a second, differently computed phase estimate. It answers agree, disagree (with the correction) or uncertain, with a note saying why, and never agrees with a label it found no evidence for. Modes: `off` (default; data scientists audit everything), `triage` (auto-agreed items count as tier-1 accepted; everything it flags goes to the data scientists, flagged items first, with its finding shown; their answer decides), `replace` (it is the whole of tier 1; what it flags goes straight to the cardiologist). The cardiologist's work is unchanged except that the blinded spot-check samples auto-accepted items separately, at `auto_spot_check_fraction` (20%, at least `spot_check_min`), and report 09d gives one row per route (`tier1_by` = human or auto). **Start with `triage`.** Move to `replace` only when the `auto` row of 09d passes its spot-check and `auto_calibration()` shows data scientists rarely overturn its flags.
+
 Everyone who audits needs a workspace account and DUA, and is listed by user name under `audit:` in `config/study.yaml`. The code refuses tier-1 answers from anyone not listed as a data scientist, tier-2 answers from anyone not listed as a cardiologist, and adjudication of an item by someone who audited it at tier 1.
 - **Approver** — decides go / no-go at the three gates (Steps 3–4) and accepts the model (Step 7).
 
@@ -82,7 +84,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (43 at the time of writing). It takes about 12 minutes on CPU, less on GPU.
+   Expect every test to pass (57 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -192,6 +194,12 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    echo_store = AnnotationStore(f"{WB}/annot/echo.csv")
    audit = LabelAudit.from_config(echo_audit_items(echo_store), f"{WB}/annot/echo_audit.csv", cfg)
 
+   # optional automatic tier 1 (audit.auto_tier1: triage or replace); run before the data scientists start.
+   # check_model: a view model retrained on the reviewed clips, not the one that made the labels.
+   from annotate.auto_audit import audit_echo
+   audit.submit_auto(audit_echo(audit.items, echo_store, f"{WB}/annot/cache",
+                                view_model=f"{WB}/annot/view_model_check.pt"))
+
    # tier 1: each data scientist, in their own notebook
    AuditScreen(audit, "<ds user>", tier=1, echo_cache=f"{WB}/annot/cache").show()
    # tier 2: the cardiologist, after tier 1 is finished
@@ -203,9 +211,10 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    ```python
    apply_to_echo_store(audit, echo_store)
    write_report(audit.report(cfg.min_cell_size, cfg.audit["spot_check_target"]), "09d_echo_label_audit", cfg.report_dir)
+   write_report(audit.auto_calibration(cfg.min_cell_size), "09e_echo_auto_audit", cfg.report_dir)   # if auto tier 1 was used
    ```
 
-   If there are too many clips to audit them all, pass `echo_audit_items(echo_store, sample=5000)` to audit a random sample instead; say so in the study report.
+   For the check model, train a second view model after the review round (`python -m annotate.echo train-views ... --out $WB/annot/view_model_check.pt`); without one, clips whose view came only from the labelling model are marked uncertain and go to a person. If there are too many clips to audit them all, pass `echo_audit_items(echo_store, sample=5000)` to audit a random sample instead; say so in the study report.
 5. **Check and finalize:**
 
    ```bash
@@ -217,7 +226,7 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    `qa-report` writes `reports/09b_echo_annotation_qa.csv` (auto-vs-human agreement); `finalize` writes the annotated manifest and `reports/09a_echo_views.csv`. A clip whose automatic view is below 0.9 confidence and that no one reviewed gets no view, so it is left out rather than trained on as a guess.
 6. **Use the annotated manifest:** in `config/study.yaml` set `echo_source.manifest` to `$WB/annot/echo_manifest_annotated.parquet` and `echo_source.path` to `null` (its paths are already complete).
 
-**Go when:** in report 09d the spot-check passes (the cardiologist agrees with tier-1-accepted labels, lower 95% bound at least `spot_check_target`, 0.95 by default), nothing is pending, and report 09a shows most clips have a view (proposed limits; agree them before the run). If the spot-check fails, tier 1 is letting errors through: raise `spot_check_fraction`, or set `tier1_per_item: 2` and audit again.
+**Go when:** in report 09d the spot-check passes (the cardiologist agrees with tier-1-accepted labels, lower 95% bound at least `spot_check_target`, 0.95 by default), nothing is pending, and report 09a shows most clips have a view (proposed limits; agree them before the run). If the spot-check fails, tier 1 is letting errors through: raise `spot_check_fraction`, or set `tier1_per_item: 2` and audit again. With the automatic tier 1 on, read the `human` and `auto` rows separately: if only the `auto` row fails, go back to `auto_tier1: triage` (or `off`) and have the data scientists audit the auto-accepted items.
 
 ## Step 3 — Feasibility counts and the three gates
 
@@ -286,8 +295,15 @@ Goal: check the automatic condition labels against the records before training o
    from annotate.audit import LabelAudit, phenotype_audit_items
    from annotate.audit_ui import AuditScreen
    audit = LabelAudit.from_config(phenotype_audit_items(s), f"{WB}/annot/phenotype_audit.csv", cfg)
+
+   # optional automatic tier 1 (audit.auto_tier1: triage or replace), before the data scientists start
+   from annotate.auto_audit import audit_phenotypes
+   audit.submit_auto(audit_phenotypes(audit.items, f"{WB}/annot/context.pkl"))
+
    AuditScreen(audit, "<ds user>", tier=1, phenotype_context=f"{WB}/annot/context.pkl").show()
    ```
+
+   With `triage`, each data scientist's queue holds only the records the automatic auditor flagged, flagged ones first, with its finding (for example "against: cath/PCI 1 day(s) before the dissection code") shown above the record. With `replace` the queue is empty and you go straight to step 3. The automatic auditor needs notes to work from: a record with no notes in the window is always marked uncertain, so if the platform exposes few notes, most records still reach a person.
 
    The screen shows the automatic label and the question (for example "Spontaneous coronary artery dissection, not iatrogenic or traumatic?"). Answer **Agree**, **Disagree** (the label is flipped) or **Uncertain**, with a short note whenever you disagree or are unsure.
 3. **Tier 2, cardiologist, blinded.** When tier 1 is finished:
@@ -304,6 +320,7 @@ Goal: check the automatic condition labels against the records before training o
    from mcp_adapter.privacy import write_report
    write_report(audit.report(cfg.min_cell_size, cfg.audit["spot_check_target"]), "09d_phenotype_label_audit", cfg.report_dir)
    write_report(phenotype_validation(audit, s, cfg.min_cell_size), "09c_phenotype_validation", cfg.report_dir)
+   write_report(audit.auto_calibration(cfg.min_cell_size), "09e_phenotype_auto_audit", cfg.report_dir)   # if auto tier 1 was used
    labels = pd.read_pickle(f"{WB}/hcman_study/labels.pkl")
    labels.to_pickle(f"{WB}/hcman_study/labels_automatic.pkl")          # keep the original
    new, changed = apply_to_labels(audit, labels)
@@ -312,7 +329,7 @@ Goal: check the automatic condition labels against the records before training o
 
    Report 09d gives, per condition: tier-1 agreement with the rules, how many items went to tier 2 and why, how often the cardiologist upheld the rules on disagreements, and the spot-check agreement with its 95% interval. That interval estimates how many wrong labels tier 1 lets through. Report 09c gives PPV and NPV against the audited labels; with 50 reviewed positives, PPV is known to about ±0.1. `apply_to_labels` replaces the automatic labels of the audited women with the final ones, so training (Step 6) uses them.
 
-**Go when:** for every condition, PPV is at least 0.80, the spot-check passes (lower 95% bound at least `spot_check_target`) and nothing is pending (proposed limits; agree them before the audit). If PPV falls short, read the notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and audit a fresh sample. If the spot-check fails, set `tier1_per_item: 2` and audit again.
+**Go when:** for every condition, PPV is at least 0.80, the spot-check passes (lower 95% bound at least `spot_check_target`) and nothing is pending (proposed limits; agree them before the audit). If PPV falls short, read the notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and audit a fresh sample. If the spot-check fails, set `tier1_per_item: 2` and audit again; if only the `auto` row fails, step the automatic tier 1 back from `replace` to `triage`, or from `triage` to `off`.
 
 ## Step 5 — Build the pre-training pool and pre-train from scratch
 
@@ -476,6 +493,7 @@ Tick each item as it is done; write the run folder names and decisions next to t
 
 - [ ] Workspace approved and A100 40 GB reservation confirmed
 - [ ] Auditors listed under `audit:` in `config/study.yaml` (data scientists and cardiologist, nobody in both)
+- [ ] Automatic tier 1 chosen (`audit.auto_tier1`: off, or triage first); if used, the `auto` row of each 09d report passes its spot-check
 - [ ] Outside annotators hired; up to 5 seats issued with `cardioailive.com` accounts; each annotator's DUA form submitted
 - [ ] `ml/` code reviewed and whitelisted by MCP
 - [ ] Radiology training done: request process known; clinic-number mapping confirmed; `FACT_ECHO_TEST` date and patient columns set; ECG storage format known

@@ -10,6 +10,16 @@
                how many wrong labels slip through tier 1 (automation bias included).
            The three kinds are shuffled together so the cardiologist cannot tell which is which.
 
+Optional automatic tier 1 (`auto_tier1`, see annotate.auto_audit): an automatic auditor checks
+each label against independent evidence first.
+  off      — data scientists audit everything (default).
+  triage   — items the auditor agrees with are tier-1 accepted without a data scientist; the
+             ones it disagrees with or is unsure about go to the data scientists, whose answer decides.
+  replace  — the auditor is tier 1; its disagreements and uncertain items go straight to tier 2.
+The spot-check samples auto-accepted and human-accepted items separately
+(`auto_spot_check_fraction` / `spot_check_fraction`, each at least `spot_check_min`), so the
+report shows how many wrong labels each route lets through.
+
 Final label per item: the cardiologist's when there is one; otherwise the automatic label if
 tier 1 agreed; otherwise pending (not used for training until adjudicated).
 
@@ -34,6 +44,8 @@ from .phenotype import task_name, wilson
 from .store import AnnotationStore
 
 VERDICTS = ("agree", "disagree", "uncertain")
+AUTO_MODES = ("off", "triage", "replace")
+AUTO_AUDITOR, AUTO_SOURCE = "auto-audit", "auto:audit"
 ECHO_TASK = "echo"
 FRAME_TOLERANCE = 2          # ED / ES within this many frames count as the same
 
@@ -103,6 +115,8 @@ class LabelAudit:
     spot_check_min: int = 20
     tier1_per_item: int = 1
     seed: int = 0
+    auto_tier1: str = "off"                   # off | triage | replace (annotate.auto_audit)
+    auto_spot_check_fraction: float = 0.20    # of auto-accepted items
     _key: pd.Index = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -111,6 +125,10 @@ class LabelAudit:
         overlap = set(self.data_scientists) & set(self.cardiologists)
         if overlap:
             raise ValueError(f"{sorted(overlap)} listed as both data scientist and cardiologist")
+        if self.auto_tier1 not in AUTO_MODES:
+            raise ValueError(f"auto_tier1 must be one of {AUTO_MODES}")
+        if AUTO_AUDITOR in set(self.data_scientists) | set(self.cardiologists):
+            raise ValueError(f"{AUTO_AUDITOR!r} is reserved for the automatic auditor")
         self.items = self.items.drop_duplicates(["item_id", "task"]).reset_index(drop=True)
         self.items["item_id"] = self.items.item_id.astype(str)
 
@@ -122,12 +140,16 @@ class LabelAudit:
         return cls(items, store, list(a["data_scientists"]), list(a["cardiologists"]),
                    spot_check_fraction=float(a.get("spot_check_fraction", 0.10)),
                    spot_check_min=int(a.get("spot_check_min", 20)),
-                   tier1_per_item=int(a.get("tier1_per_item", 1)), seed=cfg.seed)
+                   tier1_per_item=int(a.get("tier1_per_item", 1)), seed=cfg.seed,
+                   auto_tier1=str(a.get("auto_tier1", "off") or "off"),
+                   auto_spot_check_fraction=float(a.get("auto_spot_check_fraction", 0.20)))
 
     # ---- raw reads
-    def _tier(self, tier: int) -> pd.DataFrame:
+    def _tier(self, tier: int, auto: bool = False) -> pd.DataFrame:
+        """Tier answers from people; with auto=True, tier-1 rows of the automatic auditor too."""
         df = self.store.read()
-        df = df[df.task.str.startswith(f"audit{tier}:", na=False) & (df.source == "human")].copy()
+        ok = (df.source == "human") | ((df.source == AUTO_SOURCE) & auto & (tier == 1))
+        df = df[df.task.str.startswith(f"audit{tier}:", na=False) & ok].copy()
         df["task"] = df.task.str.slice(len(f"audit{tier}:"))
         if tier == 1:
             parsed = df.value.map(json.loads)
@@ -136,17 +158,79 @@ class LabelAudit:
         # one answer per reviewer per item: their latest
         return df.sort_values("ts", kind="stable").groupby(["item_id", "task", "annotator"]).tail(1)
 
+    # ---- automatic tier 1
+    def submit_auto(self, verdicts: pd.DataFrame) -> int:
+        """Store the automatic auditor's verdicts (annotate.auto_audit). Re-running replaces
+        earlier automatic verdicts (the latest counts); people's answers are never touched."""
+        known = set(zip(self.items.item_id, self.items.task))
+        rows = []
+        for r in verdicts.itertuples():
+            if (str(r.item_id), r.task) not in known or r.verdict not in VERDICTS:
+                continue
+            val = r.value if r.verdict == "disagree" else (self._auto(r.item_id, r.task) if r.verdict == "agree" else None)
+            if r.verdict == "disagree" and (val is None or (isinstance(val, float) and pd.isna(val))
+                                            or same(r.task, val, self._auto(r.item_id, r.task))):
+                continue                                     # a disagreement without a correction is not usable
+            rows.append({"item_id": str(r.item_id), "task": f"audit1:{r.task}",
+                         "value": json.dumps({"verdict": r.verdict, "value": val}),
+                         "confidence": getattr(r, "confidence", None), "source": AUTO_SOURCE,
+                         "annotator": AUTO_AUDITOR, "note": getattr(r, "note", None)})
+        return self.store.add(rows)
+
+    def _t1_effective(self) -> dict:
+        """(item_id, task) -> (rows that make up tier 1, complete?, 'auto' | 'human')."""
+        t1 = self._tier(1, auto=self.auto_tier1 != "off")
+        out = {}
+        for key, g in t1.groupby(["item_id", "task"]):
+            hum, aut = g[g.annotator != AUTO_AUDITOR], g[g.annotator == AUTO_AUDITOR]
+            if self.auto_tier1 == "replace" and len(aut):
+                rows, done, by = (aut if hum.empty else g), True, "auto" if hum.empty else "human"
+            elif self.auto_tier1 == "triage" and len(aut) and hum.empty and (aut.verdict == "agree").all():
+                rows, done, by = aut, True, "auto"
+            else:                                            # people decide (auto verdict is a hint)
+                rows, done, by = hum, len(hum) >= self.tier1_per_item, "human"
+            out[key] = (rows, done, by)
+        return out
+
+    def _t1_state(self) -> pd.DataFrame:
+        """item_id, task, outcome (accepted | disagreement | uncertain), by (auto | human) for every
+        item whose tier 1 is complete."""
+        rows = []
+        for (i, t), (g, done, by) in self._t1_effective().items():
+            if not done or g.empty:
+                continue
+            auto = self._auto(i, t)
+            labels = [r.corrected if r.verdict == "disagree" else auto for r in g.itertuples() if r.verdict != "uncertain"]
+            if (g.verdict == "uncertain").any():
+                o = "uncertain"
+            elif not all(same(t, x, auto) for x in labels):
+                o = "disagreement"
+            else:
+                o = "accepted"
+            rows.append((i, t, o, by))
+        return pd.DataFrame(rows, columns=["item_id", "task", "outcome", "by"])
+
+    def auto_verdicts(self) -> pd.DataFrame:
+        """Latest automatic verdict per item (item_id, task, verdict, corrected, note)."""
+        t = self._tier(1, auto=True)
+        return t[t.annotator == AUTO_AUDITOR][["item_id", "task", "verdict", "corrected", "confidence", "note"]]
+
     # ---- tier 1
     def tier1_queue(self, annotator: str) -> pd.DataFrame:
         """Items this data scientist has not audited that still need tier-1 reviews."""
         t1 = self._tier(1)
         mine = set(zip(t1[t1.annotator == annotator].item_id, t1[t1.annotator == annotator].task))
-        n = t1.groupby(["item_id", "task"]).size()
-        need = [(i, t) not in mine and n.get((i, t), 0) < self.tier1_per_item
+        eff = self._t1_effective()
+        need = [(i, t) not in mine and not eff.get((i, t), (None, False))[1]
                 for i, t in zip(self.items.item_id, self.items.task)]
         q = self.items[need]
-        return q.assign(_h=[_hash(f"{annotator}|{i}|{t}", self.seed) for i, t in zip(q.item_id, q.task)]
-                        ).sort_values("_h").drop(columns="_h").reset_index(drop=True)
+        flagged = set()
+        if self.auto_tier1 == "triage":                     # items the auditor flagged come first
+            av = self.auto_verdicts()
+            flagged = set(zip(av[av.verdict != "agree"].item_id, av[av.verdict != "agree"].task))
+        return q.assign(_f=[(i, t) not in flagged for i, t in zip(q.item_id, q.task)],
+                        _h=[_hash(f"{annotator}|{i}|{t}", self.seed) for i, t in zip(q.item_id, q.task)]
+                        ).sort_values(["_f", "_h"]).drop(columns=["_f", "_h"]).reset_index(drop=True)
 
     def submit_tier1(self, item_id, task: str, verdict: str, annotator: str,
                      value=None, note: str | None = None) -> None:
@@ -169,24 +253,15 @@ class LabelAudit:
         """Shuffled cardiologist queue: disagreements, uncertain items and the blinded spot-check.
         `reason` is for reporting only; the review screen never shows it."""
         t1 = self._tier(1)
-        rows = []
-        done1 = t1.groupby(["item_id", "task"])
-        accepted = []
-        for (i, t), g in done1:
-            if len(g) < self.tier1_per_item:
-                continue
-            auto = self._auto(i, t)
-            labels = [r.corrected if r.verdict == "disagree" else auto for r in g.itertuples() if r.verdict != "uncertain"]
-            if (g.verdict == "uncertain").any():
-                rows.append((i, t, "uncertain"))
-            elif not all(same(t, x, auto) for x in labels):
-                rows.append((i, t, "disagreement"))
-            else:
-                accepted.append((i, t))
-        # blinded spot-check over tier-1-accepted items: hash threshold, topped up to the minimum
-        acc = sorted(accepted, key=lambda k: _hash(f"spot|{k[0]}|{k[1]}", self.seed))
-        k = min(len(acc), max(self.spot_check_min, math.ceil(self.spot_check_fraction * len(acc))))
-        rows += [(i, t, "spot-check") for i, t in acc[:k]]
+        st = self._t1_state()
+        rows = [(r.item_id, r.task, r.outcome) for r in st.itertuples() if r.outcome != "accepted"]
+        # blinded spot-check over tier-1-accepted items, sampled separately for items accepted by
+        # people and by the automatic auditor: hash threshold, topped up to the minimum
+        for by, frac in (("human", self.spot_check_fraction), ("auto", self.auto_spot_check_fraction)):
+            acc = st[(st.outcome == "accepted") & (st.by == by)]
+            acc = sorted(zip(acc.item_id, acc.task), key=lambda k: _hash(f"spot|{k[0]}|{k[1]}", self.seed))
+            k = min(len(acc), max(self.spot_check_min, math.ceil(frac * len(acc))))
+            rows += [(i, t, "spot-check") for i, t in acc[:k]]
         q = pd.DataFrame(rows, columns=["item_id", "task", "reason"])
         t2 = self._tier(2)
         done = set(zip(t2.item_id, t2.task))
@@ -215,13 +290,13 @@ class LabelAudit:
         return m.auto_value.iloc[0]
 
     def final_labels(self) -> pd.DataFrame:
-        """item_id, task, auto_value, final_value, status, reason."""
-        t1, t2 = self._tier(1), self._tier(2)
+        """item_id, task, auto_value, final_value, status, reason, tier1_by (auto | human)."""
+        t2 = self._tier(2)
         t2v = t2.set_index(["item_id", "task"]).value if len(t2) else pd.Series(dtype=str)
         q = self.tier2_queue()
         all_t2 = pd.concat([q, self._tier2_reasons_done()], ignore_index=True)
         reason = {(r.item_id, r.task): r.reason for r in all_t2.itertuples()}
-        n1 = t1.groupby(["item_id", "task"]).size() if len(t1) else pd.Series(dtype=int)
+        eff = self._t1_effective()
         out = []
         for r in self.items.itertuples():
             key = (r.item_id, r.task)
@@ -230,43 +305,38 @@ class LabelAudit:
                 v = t2v[key]
                 status = "pending" if str(v).lower() == "unsure" else "cardiologist"
                 final = None if status == "pending" else v
-            elif n1.get(key, 0) < self.tier1_per_item:
+            elif not eff.get(key, (None, False))[1]:
                 final, status = None, "awaiting tier 1"
             elif why in ("disagreement", "uncertain"):
                 final, status = None, "awaiting tier 2"
             else:
                 final, status = r.auto_value, "tier 1 confirmed"
             out.append({"item_id": r.item_id, "task": r.task, "auto_value": r.auto_value,
-                        "final_value": final, "status": status, "reason": why})
+                        "final_value": final, "status": status, "reason": why,
+                        "tier1_by": eff.get(key, (None, False, "human"))[2]})
         return pd.DataFrame(out)
 
     def _tier2_reasons_done(self) -> pd.DataFrame:
         """Reasons for items already adjudicated (they have left the queue)."""
-        t1, t2 = self._tier(1), self._tier(2)
-        rows = []
+        t2 = self._tier(2)
         done = set(zip(t2.item_id, t2.task))
-        for (i, t), g in t1.groupby(["item_id", "task"]):
-            if (i, t) not in done:
-                continue
-            auto = self._auto(i, t)
-            if (g.verdict == "uncertain").any():
-                rows.append((i, t, "uncertain"))
-            elif not all(same(t, (r.corrected if r.verdict == "disagree" else auto), auto)
-                         for r in g.itertuples()):
-                rows.append((i, t, "disagreement"))
-            else:
-                rows.append((i, t, "spot-check"))
-        return pd.DataFrame(rows, columns=["item_id", "task", "reason"])
+        st = self._t1_state()
+        st = st[[k in done for k in zip(st.item_id, st.task)]]
+        return pd.DataFrame({"item_id": st.item_id, "task": st.task,
+                             "reason": st.outcome.replace({"accepted": "spot-check"})})
 
     def report(self, min_cell: int = 11, spot_check_target: float = 0.95) -> pd.DataFrame:
-        """Per task group: tier-1 agreement with the automatic labels, tier-2 workload and outcomes,
-        and the spot-check agreement (estimated accuracy of tier-1-accepted labels) with its
-        95% Wilson interval. Counts under `min_cell` are suppressed."""
+        """Per task group and tier-1 route (tier1_by: human | auto): tier-1 agreement with the
+        automatic labels, tier-2 workload and outcomes, and the spot-check agreement (estimated
+        accuracy of tier-1-accepted labels) with its 95% Wilson interval. With automatic tier 1 on,
+        the `auto` row's spot-check is what shows whether auto-accepted labels can be trusted.
+        Counts under `min_cell` are suppressed."""
         f = self.final_labels()
-        t1 = self._tier(1)
+        eff = self._t1_effective()
+        t1 = pd.concat([g for g, _, _ in eff.values()] or [self._tier(1)], ignore_index=True)
         f["group"] = f.task.str.replace("phenotype:", "", regex=False)
         rows = []
-        for gname, g in f.groupby("group"):
+        for (gname, by), g in f.groupby(["group", "tier1_by"]):
             keys = set(zip(g.item_id, g.task))
             t1g = t1[[k in keys for k in zip(t1.item_id, t1.task)]]
             n1 = len(t1g)
@@ -278,7 +348,7 @@ class LabelAudit:
             auto_right = sum(same(r.task, r.final_value, r.auto_value) for r in dis.itertuples())
             lo, hi = wilson(spot_ok, len(spot))
             rows.append({
-                "group": gname, "items": len(g),
+                "group": gname, "tier1_by": by, "items": len(g),
                 "tier1_reviews": n1, "tier1_agree": agree1,
                 "tier1_agreement": round(agree1 / n1, 3) if n1 else None,
                 "tier1_uncertain": int((t1g.verdict == "uncertain").sum()),
@@ -293,7 +363,7 @@ class LabelAudit:
                 "final": int(g.final_value.notna().sum()), "pending": int(g.final_value.isna().sum()),
             })
         out = pd.DataFrame(rows).astype(object)
-        counts = [c for c in out.columns if c not in ("group", "tier1_agreement", "spot_check_agreement",
+        counts = [c for c in out.columns if c not in ("group", "tier1_by", "tier1_agreement", "spot_check_agreement",
                                                       "spot_ci_low", "spot_ci_high", "spot_check_pass")]
         for c in counts:
             v = pd.to_numeric(out[c], errors="coerce")
@@ -302,6 +372,40 @@ class LabelAudit:
         out.loc[small, ["spot_check_agreement", "spot_ci_low", "spot_ci_high"]] = "suppressed"
         small1 = pd.to_numeric(out.tier1_reviews, errors="coerce").fillna(0) < min_cell
         out.loc[small1, "tier1_agreement"] = "suppressed"
+        return out
+
+
+    def auto_calibration(self, min_cell: int = 11) -> pd.DataFrame:
+        """How the automatic auditor's verdicts compare with people, per task group and verdict:
+        on items a data scientist also audited, how often they gave the same verdict; on items
+        the cardiologist labelled, how often the automatic label turned out right. Use it to
+        decide whether to move from triage to replace (and to spot a verdict class that is off)."""
+        av = self.auto_verdicts()
+        if av.empty:
+            return pd.DataFrame(columns=["group", "auto_verdict", "items", "ds_reviewed", "ds_same_verdict",
+                                         "cardiologist_labelled", "auto_label_right"])
+        hum = self._tier(1)
+        t2 = self._tier(2)
+        t2v = t2.set_index(["item_id", "task"]).value.to_dict() if len(t2) else {}
+        rows = []
+        av = av.assign(group=av.task.str.replace("phenotype:", "", regex=False))
+        for (gname, verdict), g in av.groupby(["group", "verdict"]):
+            ds_n = ds_same = c_n = c_right = 0
+            for r in g.itertuples():
+                h = hum[(hum.item_id == r.item_id) & (hum.task == r.task)]
+                if len(h):
+                    ds_n += 1
+                    ds_same += int((h.verdict == verdict).all())
+                v = t2v.get((r.item_id, r.task))
+                if v is not None and str(v).lower() != "unsure":
+                    c_n += 1
+                    c_right += int(same(r.task, v, self._auto(r.item_id, r.task)))
+            rows.append({"group": gname, "auto_verdict": verdict, "items": len(g), "ds_reviewed": ds_n,
+                         "ds_same_verdict": ds_same, "cardiologist_labelled": c_n, "auto_label_right": c_right})
+        out = pd.DataFrame(rows).astype(object)
+        for c in out.columns[2:]:
+            v = pd.to_numeric(out[c], errors="coerce")
+            out.loc[(v > 0) & (v < min_cell), c] = f"<{min_cell}"
         return out
 
 

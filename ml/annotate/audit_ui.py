@@ -6,6 +6,9 @@ correction) or Uncertain:
     from annotate.audit_ui import AuditScreen
     AuditScreen(audit, annotator="ds_jane", tier=1, phenotype_context=ctx, echo_cache=cache).show()
 
+With the automatic tier 1 on (audit.auto_tier1), the tier-1 screen also shows the automatic
+auditor's finding (verdict and why) for the items it flagged; the data scientist's answer decides.
+
 Tier 2, cardiologist — the same screen with tier=2. No automatic or data-scientist label is shown,
 and disagreements, uncertain items and spot-checks are shuffled together, so the cardiologist
 labels every item independently.
@@ -48,6 +51,11 @@ class AuditScreen:
                       else self.audit.tier2_queue(self.annotator)[["item_id", "task"]])
         self.pos = 0
         self._clip = None
+        self._auto_audit = {}
+        if self.tier == 1 and self.audit.auto_tier1 != "off":
+            av = self.audit.auto_verdicts()
+            self._auto_audit = {(r.item_id, r.task): {"verdict": r.verdict, "note": r.note}
+                                for r in av.itertuples()}
 
     def remaining(self) -> int:
         return max(0, len(self.queue) - self.pos)
@@ -61,6 +69,9 @@ class AuditScreen:
         item = {"item_id": r.item_id, "task": r.task, "kind": "echo" if r.task == ECHO_TASK else "phenotype"}
         if self.tier == 1:
             item["auto_value"] = self.audit._auto(r.item_id, r.task)
+            av = self._auto_audit.get((r.item_id, r.task))
+            if av is not None:
+                item["auto_audit"] = av
         if item["kind"] == "echo":
             if self._clip is None or self._clip[0] != r.item_id:
                 frames, _ = read_clip(self.paths[r.item_id])
@@ -135,12 +146,17 @@ class AuditScreen:
                         else "Tier 2: give your own label (no other labels are shown)")
             head.value = f"<b>{self.remaining()} left</b> · {tier_txt}"
             note.value = ""; msg.value = ""
+            hint = ""
+            if c.get("auto_audit"):
+                a = c["auto_audit"]
+                hint = (f"<p style='background:#fef3c7;padding:4px 8px'>Automatic audit: "
+                        f"<b>{html.escape(str(a['verdict']))}</b> — {html.escape(str(a['note'] or ''))}</p>")
             if c["kind"] == "phenotype":
                 shown = PhenotypeReviewer.render(c)
                 if self.tier == 1:
                     shown = (f"<p style='font-size:15px'><b>Automatic label: {html.escape(str(c['auto_value']).upper())}</b>"
                              f" — {html.escape(c['question'])}</p>") + shown
-                body.value = shown
+                body.value = hint + shown
                 btns = [b_agree, b_dis, b_unc] if self.tier == 1 else [b_yes, b_no, b_uns]
                 box.children = [head, body, note, W.HBox(btns + [b_skip]), msg]
             else:
@@ -148,6 +164,7 @@ class AuditScreen:
                 body.value = (f"<p><b>Automatic: view {v['view']}, ED frame {v['ed']}, ES frame {v['es']}</b>. "
                               "Agree if right; otherwise set the correct view and frames and press Disagree.</p>"
                               if self.tier == 1 else "<p>Choose the view and mark the ED and ES frames.</p>")
+                body.value = hint + body.value
                 view.value = v["view"] if v["view"] in HUMAN_VIEWS else None
                 ed.value, es.value = v["ed"] or 0, v["es"] or 0
                 frame.max = len(c["frames"]) - 1; frame.value = ed.value
