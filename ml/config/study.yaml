@@ -97,6 +97,17 @@ reports:
     person_key: clinic_number
     date_column: RADIOLOGY_DTM
 
+audit:
+  # Two-tier audit of the automatic labels (annotate.audit; runbook Steps 2b and 4b).
+  # Tier 1: data scientists audit every item. Tier 2: a cardiologist adjudicates disagreements,
+  # uncertain items and a blinded spot-check. Use workspace user names; nobody can be in both lists.
+  data_scientists: []              # TODO: e.g. [ds_ana, ds_ben]
+  cardiologists: []                # TODO: the outside cardiologist(s) on Cardio AI's annotator seats
+  tier1_per_item: 1                # data scientists per item (2 = double audit; their disagreements go to tier 2)
+  spot_check_fraction: 0.10        # share of tier-1-accepted items re-labelled blind by the cardiologist
+  spot_check_min: 20               # at least this many spot-checks per audit
+  spot_check_target: 0.95          # pass when the spot-check agreement's 95% CI lower bound reaches this
+
 sampling:
   # Minimum targets from the Model Details Form; the feasibility query decides real N.
   stratum_targets:
