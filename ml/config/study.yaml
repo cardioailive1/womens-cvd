@@ -16,6 +16,7 @@ platform:
   dicom_inventory:
     table: FACT_RADIOLOGY_DICOM_INVENTORY   # TODO(MCP): add the schema prefix if needed
     patient_column: PATIENT_CLINIC_NUMBER   # Mayo clinic number, mapped to OMOP via person_map below
+    patient_dk_column: PATIENT_DK           # required in the de-identification submission CSV
     study_uid_column: STUDY_INSTANCE_UID
     series_uid_column: SERIES_INSTANCE_UID
     accession_column: DICOM_ACCESSION_NUMBER   # = FACT_RADIOLOGY.ACCESSION_NBR
