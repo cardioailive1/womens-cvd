@@ -9,10 +9,10 @@ This runbook takes HCMAN from an empty Mayo Clinic Platform workbench to a train
 ```mermaid
 flowchart LR
     S1["1 · Setup<br/>all tests pass"] --> S2["2 · Configure<br/>5 ECG + 5 echo load"]
-    S2 --> S2b["2b · Annotate echo<br/>views + ED/ES"]
+    S2 --> S2b["2b · Annotate + audit echo<br/>views + ED/ES"]
     S2b --> S3["3 · Feasibility<br/>Gate 1: enough cases"]
     S3 --> S4["4 · Study tables<br/>Gates 2, 3: imaging, sites"]
-    S4 --> S4b["4b · Chart review<br/>label PPV / NPV"]
+    S4 --> S4b["4b · Audit labels<br/>2 tiers · PPV / NPV"]
     S4b --> S5["5 · Pre-train<br/>4 stages, no labels"]
     S5 --> S6["6 · Fine-tune<br/>ablation, then full"]
     S6 --> S7["7 · Evaluate<br/>accept or iterate"]
@@ -41,7 +41,12 @@ You need seven things in place before any code runs in the workbench; the code-r
 **Roles for the run:**
 
 - **Run owner** — runs every step, keeps the run checklist at the end of this runbook.
-- **Clinical reviewers** — sign off code lists (Step 2), label echo clips (Step 2b, a sonographer or cardiologist), review records against the automatic labels (Step 4b, a cardiologist) and read the label prevalence report (Step 4). They must be outside readers on Cardio AI's annotator seats; Mayo staff cannot do this work.
+- **Data scientists (audit tier 1)** — label the echo seed set (Step 2b) and audit every automatic label, echo and condition alike (Steps 2b and 4b): agree, disagree with a correction, or mark uncertain.
+- **Cardiologist (audit tier 2)** — signs off code lists (Step 2), reads the label prevalence report (Step 4) and adjudicates, blinded, every disagreement, every uncertain item and a random spot-check of items tier 1 accepted (Steps 2b and 4b). Must be an outside reader on Cardio AI's annotator seats; Mayo staff cannot do this work.
+
+Optionally, an **automatic auditor** can do a first tier-1 pass (`audit.auto_tier1` in `config/study.yaml`). It checks each automatic label against evidence the labelling did not use: for conditions, the clinical and report notes (with negation and history cues), procedures (a catheterisation or PCI just before a coronary dissection code points to an iatrogenic dissection, not SCAD) and the LVEF stated in echo reports; for echo clips, the DICOM view name against a separately trained view model, and the labelled ED frame against a second, differently computed phase estimate. It answers agree, disagree (with the correction) or uncertain, with a note saying why, and never agrees with a label it found no evidence for. Modes: `off` (default; data scientists audit everything), `triage` (auto-agreed items count as tier-1 accepted; everything it flags goes to the data scientists, flagged items first, with its finding shown; their answer decides), `replace` (it is the whole of tier 1; what it flags goes straight to the cardiologist). The cardiologist's work is unchanged except that the blinded spot-check samples auto-accepted items separately, at `auto_spot_check_fraction` (20%, at least `spot_check_min`), and report 09d gives one row per route (`tier1_by` = human or auto). **Start with `triage`.** Move to `replace` only when the `auto` row of 09d passes its spot-check and `auto_calibration()` shows data scientists rarely overturn its flags.
+
+Everyone who audits needs a workspace account and DUA, and is listed by user name under `audit:` in `config/study.yaml`. The code refuses tier-1 answers from anyone not listed as a data scientist, tier-2 answers from anyone not listed as a cardiologist, and adjudication of an item by someone who audited it at tier 1.
 - **Approver** — decides go / no-go at the three gates (Steps 3–4) and accepts the model (Step 7).
 
 **What MCP confirmed (14-15 Oct 2026):** `pip install` works in the workspace; local web apps can run on localhost; Docker containers run but cannot pull images, so they must be self-contained; a remote desktop with 3D Slicer and ITK-SNAP is already installed. There are no existing image annotations on the platform; labels come from radiology reports and echo notes. Public datasets should stay outside the environment unless essential. DICOM images are requested through `FACT_RADIOLOGY_DICOM_INVENTORY`. A self-contained Docker image saved as a tar file is imported the same way as other files. GPUs are assigned automatically when available. From the Radiology deck: the inventory has one row per DICOM instance, keyed by `PATIENT_CLINIC_NUMBER` and `STUDY_INSTANCE_UID`; only instances with `IMAGE_DEID_STATUS` Ready or Available can be requested; images link to reports through `DICOM_ACCESSION_NUMBER` = `FACT_RADIOLOGY.ACCESSION_NBR`; radiology reports are also in the OMOP `note` table; the inventory itself is not in OMOP.
@@ -79,7 +84,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (37 at the time of writing). It takes about 12 minutes on CPU, less on GPU.
+   Expect every test to pass (57 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -176,7 +181,41 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    ```
 
    Clips are decoded only once, so re-runs are quick. Repeat steps 2 and 3 until the queue is small. The queue always includes a fixed 5% sample of confidently auto-labelled clips, which measures how accurate the automatic labels are.
-4. **Check and finalize:**
+4. **Audit (two tiers).** Every automatically labelled clip is audited before it is used. List the auditors under `audit:` in `config/study.yaml` first.
+
+   ```python
+   import sys; sys.path.insert(0, ".")
+   from mcp_adapter.config import StudyConfig
+   from mcp_adapter.privacy import write_report
+   from annotate.audit import LabelAudit, echo_audit_items, apply_to_echo_store
+   from annotate.audit_ui import AuditScreen
+   from annotate.store import AnnotationStore
+   cfg, WB = StudyConfig.load("config/study.yaml"), "/workbench"
+   echo_store = AnnotationStore(f"{WB}/annot/echo.csv")
+   audit = LabelAudit.from_config(echo_audit_items(echo_store), f"{WB}/annot/echo_audit.csv", cfg)
+
+   # optional automatic tier 1 (audit.auto_tier1: triage or replace); run before the data scientists start.
+   # check_model: a view model retrained on the reviewed clips, not the one that made the labels.
+   from annotate.auto_audit import audit_echo
+   audit.submit_auto(audit_echo(audit.items, echo_store, f"{WB}/annot/cache",
+                                view_model=f"{WB}/annot/view_model_check.pt"))
+
+   # tier 1: each data scientist, in their own notebook
+   AuditScreen(audit, "<ds user>", tier=1, echo_cache=f"{WB}/annot/cache").show()
+   # tier 2: the cardiologist, after tier 1 is finished
+   AuditScreen(audit, "<cardiologist user>", tier=2, echo_cache=f"{WB}/annot/cache").show()
+   ```
+
+   At tier 1 the screen shows the automatic view and frames: **Agree** if right; otherwise set the right view and frames and press **Disagree**, or press **Uncertain**. At tier 2 the cardiologist sees no earlier labels and labels each clip from scratch. The queue mixes every disagreement, every uncertain clip and a random 10% (at least 20) of the clips tier 1 accepted, in random order. When tier 2 is done, write the audited labels back so `finalize` uses them, and save the audit report:
+
+   ```python
+   apply_to_echo_store(audit, echo_store)
+   write_report(audit.report(cfg.min_cell_size, cfg.audit["spot_check_target"]), "09d_echo_label_audit", cfg.report_dir)
+   write_report(audit.auto_calibration(cfg.min_cell_size), "09e_echo_auto_audit", cfg.report_dir)   # if auto tier 1 was used
+   ```
+
+   For the check model, train a second view model after the review round (`python -m annotate.echo train-views ... --out $WB/annot/view_model_check.pt`); without one, clips whose view came only from the labelling model are marked uncertain and go to a person. If there are too many clips to audit them all, pass `echo_audit_items(echo_store, sample=5000)` to audit a random sample instead; say so in the study report.
+5. **Check and finalize:**
 
    ```bash
    python -m annotate.echo qa-report --config config/study.yaml --store $WB/annot/echo.csv
@@ -185,9 +224,9 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    ```
 
    `qa-report` writes `reports/09b_echo_annotation_qa.csv` (auto-vs-human agreement); `finalize` writes the annotated manifest and `reports/09a_echo_views.csv`. A clip whose automatic view is below 0.9 confidence and that no one reviewed gets no view, so it is left out rather than trained on as a guess.
-5. **Use the annotated manifest:** in `config/study.yaml` set `echo_source.manifest` to `$WB/annot/echo_manifest_annotated.parquet` and `echo_source.path` to `null` (its paths are already complete).
+6. **Use the annotated manifest:** in `config/study.yaml` set `echo_source.manifest` to `$WB/annot/echo_manifest_annotated.parquet` and `echo_source.path` to `null` (its paths are already complete).
 
-**Go when:** on the QA sample, view agreement is at least 0.95 and ED is within 2 frames of the reviewer's in at least 90% of clips (proposed limits; agree them before the run), and report 09a shows most clips have a view.
+**Go when:** in report 09d the spot-check passes (the cardiologist agrees with tier-1-accepted labels, lower 95% bound at least `spot_check_target`, 0.95 by default), nothing is pending, and report 09a shows most clips have a view (proposed limits; agree them before the run). If the spot-check fails, tier 1 is letting errors through: raise `spot_check_fraction`, or set `tier1_per_item: 2` and audit again. With the automatic tier 1 on, read the `human` and `auto` rows separately: if only the `auto` row fails, go back to `auto_tier1: triage` (or `off`) and have the data scientists audit the auto-accepted items.
 
 ## Step 3 — Feasibility counts and the three gates
 
@@ -234,9 +273,9 @@ Row-level tables land in `$WB/hcman_study/` and must stay there. Review each rep
 
 The clinical reviewer reads 04 for plausibility; the approver signs gates 2 and 3. If you change anything in the config, rebuild — the splits are seeded, so the same config always gives the same split.
 
-## Step 4b — Chart review of the automatic labels
+## Step 4b — Two-tier audit of the automatic condition labels
 
-Goal: measure how often the automatic condition labels are right before training on them. The labels come from diagnosis codes, and a cardiologist checks a sample of records against them. This is where errors such as catheter-induced coronary dissections counted as SCAD show up.
+Goal: check the automatic condition labels against the records before training on them, in two tiers. Data scientists audit every sampled record; a cardiologist adjudicates the disagreements, the uncertain cases and a small blinded spot-check. The labels come from diagnosis codes, so this is where errors such as catheter-induced coronary dissections counted as SCAD show up. The audited labels then replace the automatic ones for those women, and give the PPV and NPV of each rule.
 
 1. **Draw the sample and pull the records** (same notebook as Step 4). For each condition: 50 women the rules call positive, and 50 they call negative, half of them "near misses" that had a code but did not meet the rule:
 
@@ -249,29 +288,48 @@ Goal: measure how often the automatic condition labels are right before training
    save_context(fetch_context(be, cfg, t["cohort"], s.person_id), f"{WB}/annot/context.pkl")
    ```
 
-   Each record shows diagnoses, procedures and key labs from 30 days before index to the end of follow-up, plus free-text reports. Those come from the OMOP `note` table if present, and from the Mayo tables MCP named: echo notes (`FACT_ECHO_TEST`, column `ECHO_NOTE`) and radiology reports (`FACT_RADIOLOGY`). Fill their remaining columns under `reports:` in `config/study.yaml` (patient key, date and, for radiology, the text column) after the MCP data training; a source with missing columns is skipped, not failed.
-2. **Review**, blinded: the reviewer never sees the automatic label.
+   Each record shows diagnoses, procedures and key labs from 30 days before index to the end of follow-up, plus free-text reports: radiology reports from the OMOP `note` table and echo notes from `FACT_ECHO_TEST` (fill its remaining columns under `reports:` in `config/study.yaml`; a source with missing columns is skipped, not failed).
+2. **Tier 1, data scientists, every record.** Each data scientist opens the screen in their own notebook; the work is shared out automatically.
 
    ```python
-   from annotate.review_ui import PhenotypeReviewer
-   PhenotypeReviewer(sample=f"{WB}/annot/phenotype_sample.csv", context=f"{WB}/annot/context.pkl",
-                     store=f"{WB}/annot/phenotype.csv", annotator="<your name>").show()
+   from annotate.audit import LabelAudit, phenotype_audit_items
+   from annotate.audit_ui import AuditScreen
+   audit = LabelAudit.from_config(phenotype_audit_items(s), f"{WB}/annot/phenotype_audit.csv", cfg)
+
+   # optional automatic tier 1 (audit.auto_tier1: triage or replace), before the data scientists start
+   from annotate.auto_audit import audit_phenotypes
+   audit.submit_auto(audit_phenotypes(audit.items, f"{WB}/annot/context.pkl"))
+
+   AuditScreen(audit, "<ds user>", tier=1, phenotype_context=f"{WB}/annot/context.pkl").show()
    ```
 
-   Answer the question shown (for example "Spontaneous coronary artery dissection, not iatrogenic or traumatic?") with Yes, No or Unsure, and add a short note when the answer is No.
-3. **Report:**
+   With `triage`, each data scientist's queue holds only the records the automatic auditor flagged, flagged ones first, with its finding (for example "against: cath/PCI 1 day(s) before the dissection code") shown above the record. With `replace` the queue is empty and you go straight to step 3. The automatic auditor needs notes to work from: a record with no notes in the window is always marked uncertain, so if the platform exposes few notes, most records still reach a person.
+
+   The screen shows the automatic label and the question (for example "Spontaneous coronary artery dissection, not iatrogenic or traumatic?"). Answer **Agree**, **Disagree** (the label is flipped) or **Uncertain**, with a short note whenever you disagree or are unsure.
+3. **Tier 2, cardiologist, blinded.** When tier 1 is finished:
 
    ```python
-   from annotate.phenotype import validation_report
-   from annotate.store import AnnotationStore
+   AuditScreen(audit, "<cardiologist user>", tier=2, phenotype_context=f"{WB}/annot/context.pkl").show()
+   ```
+
+   The queue holds every disagreement, every uncertain record and a random 10% (at least 20) of the records tier 1 accepted, shuffled together. The cardiologist sees neither the automatic label nor the data scientist's answer, and answers Yes, No or Unsure. Their answer is final; an Unsure stays pending and is not used.
+4. **Report and apply:**
+
+   ```python
+   from annotate.audit import apply_to_labels, phenotype_validation
    from mcp_adapter.privacy import write_report
-   rep = validation_report(s, AnnotationStore(f"{WB}/annot/phenotype.csv"), cfg.min_cell_size)
-   write_report(rep, "09c_phenotype_validation", cfg.report_dir); rep
+   write_report(audit.report(cfg.min_cell_size, cfg.audit["spot_check_target"]), "09d_phenotype_label_audit", cfg.report_dir)
+   write_report(phenotype_validation(audit, s, cfg.min_cell_size), "09c_phenotype_validation", cfg.report_dir)
+   write_report(audit.auto_calibration(cfg.min_cell_size), "09e_phenotype_auto_audit", cfg.report_dir)   # if auto tier 1 was used
+   labels = pd.read_pickle(f"{WB}/hcman_study/labels.pkl")
+   labels.to_pickle(f"{WB}/hcman_study/labels_automatic.pkl")          # keep the original
+   new, changed = apply_to_labels(audit, labels)
+   new.to_pickle(f"{WB}/hcman_study/labels.pkl"); changed
    ```
 
-   `09c_phenotype_validation.csv` gives PPV and NPV per condition with 95% confidence intervals. With 50 reviewed positives, PPV is known to about ±0.1.
+   Report 09d gives, per condition: tier-1 agreement with the rules, how many items went to tier 2 and why, how often the cardiologist upheld the rules on disagreements, and the spot-check agreement with its 95% interval. That interval estimates how many wrong labels tier 1 lets through. Report 09c gives PPV and NPV against the audited labels; with 50 reviewed positives, PPV is known to about ±0.1. `apply_to_labels` replaces the automatic labels of the audited women with the final ones, so training (Step 6) uses them.
 
-**Go when:** PPV is at least 0.80 for every condition (proposed; agree it before the review). If one falls short, read the reviewers' notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and review a fresh sample.
+**Go when:** for every condition, PPV is at least 0.80, the spot-check passes (lower 95% bound at least `spot_check_target`) and nothing is pending (proposed limits; agree them before the audit). If PPV falls short, read the notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and audit a fresh sample. If the spot-check fails, set `tier1_per_item: 2` and audit again; if only the `auto` row fails, step the automatic tier 1 back from `replace` to `triage`, or from `triage` to `off`.
 
 ## Step 5 — Build the pre-training pool and pre-train from scratch
 
@@ -434,6 +492,8 @@ Tick each item as it is done; write the run folder names and decisions next to t
 **Before you start**
 
 - [ ] Workspace approved and A100 40 GB reservation confirmed
+- [ ] Auditors listed under `audit:` in `config/study.yaml` (data scientists and cardiologist, nobody in both)
+- [ ] Automatic tier 1 chosen (`audit.auto_tier1`: off, or triage first); if used, the `auto` row of each 09d report passes its spot-check
 - [ ] Outside annotators hired; up to 5 seats issued with `cardioailive.com` accounts; each annotator's DUA form submitted
 - [ ] `ml/` code reviewed and whitelisted by MCP
 - [ ] Radiology training done: request process known; clinic-number mapping confirmed; `FACT_ECHO_TEST` date and patient columns set; ECG storage format known
@@ -448,10 +508,11 @@ Tick each item as it is done; write the run folder names and decisions next to t
 - [ ] Step 2: schemas and imaging sources set; 5 ECGs and 5 echo clips load
 - [ ] Step 2: clinical reviewer signed off `concepts.py`
 - [ ] Step 2b: echo seed set labelled; view model trained; QA report meets the limits
+- [ ] Step 2b: echo audit done (tier 1 complete, tier 2 complete, report 09d spot-check passes); audited labels written back
 - [ ] Step 2b: annotated echo manifest set in `config/study.yaml`
 - [ ] Step 3: gate 1 signed (cases per condition); report 01b shows every lab found
 - [ ] Step 4: reports 02–06 reviewed; gate 2 (imaging coverage) and gate 3 (sites) signed
-- [ ] Step 4b: chart review done; PPV meets the limit for every condition (report 09c)
+- [ ] Step 4b: condition-label audit done (report 09d spot-check passes, nothing pending); PPV meets the limit (report 09c); audited labels applied
 
 **Training**
 
