@@ -65,7 +65,16 @@ TERMS = {
     "CMD_INOCA": [r"microvascular\s+(dysfunction|disease|angina)", r"\bINOCA\b", r"\bANOCA\b",
                   r"\bCMD\b", r"cardiac\s+syndrome\s+x", r"non-?obstructive\s+coronary"],
     "FMD": [r"fibromuscular\s+dysplasia", r"\bFMD\b", r"string[- ]of[- ]beads"],
+    # outcomes
+    "mace": [r"myocardial\s+infarction", r"\bN?STEMI\b", r"\bMI\b", r"\bstroke\b", r"\bCVA\b",
+             r"cerebral\s+infarct", r"intracerebral\s+ha?emorrhage", r"(acute|decompensated)\s+heart\s+failure",
+             r"heart\s+failure\s+(exacerbation|admission)", r"\bADHF\b", r"\bexpired\b", r"\bdeceased\b"],
+    "postpartum_cvd": [r"myocardial\s+infarction", r"\bN?STEMI\b", r"\bstroke\b", r"\bCVA\b",
+                       r"heart\s+failure", r"cardiomyopathy", r"coronary\s+(artery\s+)?dissection", r"\bSCAD\b",
+                       r"tako-?tsubo", r"stress\s+cardiomyopathy"],
 }
+# Days after index whose notes count as evidence (outcomes: after the 7-day blanking period).
+WINDOW = {"mace": (8, 365), "postpartum_cvd": (8, 365)}
 NEGATION = re.compile(r"\b(no|not|denies|denied|without|negative\s+for|ruled?\s+out|r/o|rule\s+out|"
                       r"unlikely|excluded|free\s+of|no\s+evidence\s+of|absence\s+of|not\s+consistent\s+with)\b"
                       r"[^.;:\n]{0,40}$", re.I)
@@ -109,7 +118,9 @@ def lvef_values(text: str) -> list[float]:
 
 def _evidence(condition: str, notes: pd.DataFrame, procs: pd.DataFrame, dx: pd.DataFrame) -> dict:
     """Independent evidence for one woman and one condition (index window only: rel_day >= 0)."""
-    notes = notes[notes.rel_day >= 0] if "rel_day" in notes else notes
+    lo, hi = WINDOW.get(condition, (0, None))
+    if "rel_day" in notes:
+        notes = notes[(notes.rel_day >= lo) & ((notes.rel_day <= hi) if hi is not None else True)]
     kinds: list[str] = []
     for t in notes.text.fillna("").astype(str):
         kinds += mentions(t, condition)

@@ -198,3 +198,69 @@ def test_audit_echo(tmp_path):
     audit.submit_auto(out.reset_index())
     assert set(audit.tier1_queue("ds_ana").item_id) == set(out[out.verdict != "agree"].index)
     assert (audit.tier2_queue().reason == "spot-check").sum() >= 1
+
+
+# ------------------------------------------------------------------ outcome labels
+def test_outcome_labels_are_reviewable(tmp_path):
+    from annotate.audit import apply_to_labels, phenotype_audit_items
+    from annotate.phenotype import OUTCOMES_REVIEW, QUESTION, REVIEWABLE, sample_for_review
+    assert set(OUTCOMES_REVIEW) <= set(QUESTION) and len(REVIEWABLE) == 9
+    rng = np.random.default_rng(0)
+    n = 200
+    labels = pd.DataFrame({"person_id": np.arange(n), "y_mace": rng.integers(0, 2, n).astype(float),
+                           "m_mace": (np.arange(n) % 4 != 0).astype(float),     # 1 in 4 not observable
+                           "y_atypical": rng.integers(0, 2, n).astype(float),
+                           "m_atypical": (np.arange(n) < 60).astype(float)})
+    ev = pd.DataFrame({"person_id": [1, 2, 3, 5], "grp": ["out_heart_failure", "out_mi", "sym_atypical", "out_mi"]})
+    s = sample_for_review(labels, ev, ["mace", "atypical"], n_pos=20, n_neg=20)
+    unobs = set(labels.person_id[labels.m_mace == 0])
+    assert not set(s[s.condition == "mace"].person_id) & unobs              # only observable outcomes
+    assert set(s[s.condition == "atypical"].person_id) <= set(range(60))
+    items = phenotype_audit_items(s)
+    assert set(items.task) == {"phenotype:mace", "phenotype:atypical"}
+
+    # notes inside the 7-day blanking window are not evidence for MACE
+    one = items[items.task == "phenotype:mace"].head(1)
+    pid = int(one.item_id.iloc[0])
+    ctx = {"notes": pd.DataFrame({"person_id": [pid], "rel_day": [2], "title": ["ED"],
+                                  "text": ["Admitted with NSTEMI."]}),
+           "procedures": pd.DataFrame(columns=["person_id", "rel_day", "code", "name"]),
+           "diagnoses": pd.DataFrame(columns=["person_id", "rel_day", "code", "name"])}
+    v = audit_phenotypes(one.assign(auto_value="yes"), ctx).iloc[0]
+    assert v.verdict == "uncertain" and "0 affirmed" in v.note
+    ctx["notes"].loc[0, "rel_day"] = 40
+    assert audit_phenotypes(one.assign(auto_value="yes"), ctx).iloc[0].verdict == "agree"
+    # atypical presentation has no note rules: always goes to a person
+    at = items[items.task == "phenotype:atypical"].head(1)
+    assert audit_phenotypes(at, ctx).iloc[0].verdict == "uncertain"
+
+    # audited outcome replaces the label and marks it observable
+    audit = LabelAudit(items, AnnotationStore(tmp_path / "a.csv"), DS, CARD, spot_check_min=1)
+    hidden = labels[(labels.m_atypical == 0)].person_id.iloc[0]
+    lab2 = labels.copy()
+    lab2.loc[lab2.person_id == hidden, "y_atypical"] = 0.0
+    audit.items = pd.concat([audit.items, pd.DataFrame({"item_id": [str(hidden)], "task": ["phenotype:atypical"],
+                                                         "auto_value": ["no"]})], ignore_index=True)
+    audit.submit_tier1(str(hidden), "phenotype:atypical", "uncertain", "ds_ana")
+    audit.submit_tier2(str(hidden), "phenotype:atypical", "yes", "dr_cole")
+    new, changed = apply_to_labels(audit, lab2)
+    row = new[new.person_id == hidden].iloc[0]
+    assert row.y_atypical == 1.0 and row.m_atypical == 1.0 and changed >= 1
+
+
+def test_risk_tier_is_scored():
+    from hcman.evaluate import evaluate
+    rng = np.random.default_rng(0)
+    n = 400
+    y = rng.integers(0, 4, n)
+    P = np.eye(4)[np.where(rng.random(n) < 0.7, y, rng.integers(0, 4, n))] * 0.7 + 0.075
+    df = pd.DataFrame({"y_tier": y, "m_tier": 1.0})
+    df["p_tier"] = list(P)
+    for c in ("SCAD", "PPCM", "PREECLAMPSIA_CVD", "TAKOTSUBO", "CMD_INOCA", "FMD"):
+        df[f"y_{c}"] = rng.integers(0, 2, n); df[f"p_{c}"] = rng.random(n)
+    for h in ("mace", "postpartum", "atypical", "fmd_trigger"):
+        df[f"y_{h}"] = rng.integers(0, 2, n); df[f"p_{h}"] = rng.random(n); df[f"m_{h}"] = 1.0
+    out = evaluate(df, df, n_boot=20).set_index("task")
+    r = out.loc["risk_tier"]
+    assert 0.5 < float(r.weighted_kappa) <= 1 and 0.6 < float(r.accuracy) < 0.85
+    assert float(r.auroc) > 0.7 and "-" in r.weighted_kappa_ci

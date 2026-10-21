@@ -429,8 +429,9 @@ def apply_to_echo_store(audit: LabelAudit, echo_store: AnnotationStore, annotato
 
 
 def apply_to_labels(audit: LabelAudit, labels: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Replace automatic condition labels with the audited final labels for the women audited.
-    Returns (new labels table, number of labels changed). Pending items are left as they were."""
+    """Replace automatic condition and outcome labels with the audited final labels for the women
+    audited. Returns (new labels table, number of labels changed). Pending items are left as they
+    were. A reviewed outcome sets its mask to 1. Risk tier is not recomputed (see RUNBOOK 4b)."""
     f = audit.final_labels()
     f = f[f.task.str.startswith("phenotype:") & f.final_value.notna()]
     out = labels.copy()
@@ -442,6 +443,9 @@ def apply_to_labels(audit: LabelAudit, labels: pd.DataFrame) -> tuple[pd.DataFra
         m = pid == r.item_id
         changed += int((out.loc[m, col] != new).sum())
         out.loc[m, col] = new
+        mask = "m_" + col[2:]
+        if mask in out and mask != "m_condition":          # a reviewed outcome is observed
+            out.loc[m, mask] = 1.0
     if "y_SCAD" in out and "y_fmd_trigger" in out:          # FMD screening trigger follows SCAD
         out["y_fmd_trigger"] = out["y_SCAD"]
     return out, changed

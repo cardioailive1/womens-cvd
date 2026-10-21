@@ -84,7 +84,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (57 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
+   Expect every test to pass (59 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -273,17 +273,18 @@ Row-level tables land in `$WB/hcman_study/` and must stay there. Review each rep
 
 The clinical reviewer reads 04 for plausibility; the approver signs gates 2 and 3. If you change anything in the config, rebuild — the splits are seeded, so the same config always gives the same split.
 
-## Step 4b — Two-tier audit of the automatic condition labels
+## Step 4b — Two-tier audit of the automatic condition and outcome labels
 
 Goal: check the automatic condition labels against the records before training on them, in two tiers. Data scientists audit every sampled record; a cardiologist adjudicates the disagreements, the uncertain cases and a small blinded spot-check. The labels come from diagnosis codes, so this is where errors such as catheter-induced coronary dissections counted as SCAD show up. The audited labels then replace the automatic ones for those women, and give the PPV and NPV of each rule.
 
-1. **Draw the sample and pull the records** (same notebook as Step 4). For each condition: 50 women the rules call positive, and 50 they call negative, half of them "near misses" that had a code but did not meet the rule:
+1. **Draw the sample and pull the records** (same notebook as Step 4). For each of the six conditions and three outcome labels (MACE, postpartum CVD, atypical presentation): 50 women the rules call positive, and 50 they call negative, half of them "near misses" that had a relevant code but did not meet the rule. Outcomes are sampled only among women whose outcome is observable (mask 1):
 
    ```python
    import pandas as pd
    from annotate.phenotype import sample_for_review, fetch_context, save_context
    ev = pd.read_pickle(f"{WB}/hcman_study/code_events.pkl")
-   s = sample_for_review(t["labels"], ev, n_pos=50, n_neg=50)
+   from annotate.phenotype import REVIEWABLE          # 6 conditions + mace, postpartum_cvd, atypical
+   s = sample_for_review(t["labels"], ev, REVIEWABLE, n_pos=50, n_neg=50)
    s.to_csv(f"{WB}/annot/phenotype_sample.csv", index=False)
    save_context(fetch_context(be, cfg, t["cohort"], s.person_id), f"{WB}/annot/context.pkl")
    ```
@@ -327,9 +328,9 @@ Goal: check the automatic condition labels against the records before training o
    new.to_pickle(f"{WB}/hcman_study/labels.pkl"); changed
    ```
 
-   Report 09d gives, per condition: tier-1 agreement with the rules, how many items went to tier 2 and why, how often the cardiologist upheld the rules on disagreements, and the spot-check agreement with its 95% interval. That interval estimates how many wrong labels tier 1 lets through. Report 09c gives PPV and NPV against the audited labels; with 50 reviewed positives, PPV is known to about ±0.1. `apply_to_labels` replaces the automatic labels of the audited women with the final ones, so training (Step 6) uses them.
+   Report 09d gives, per condition: tier-1 agreement with the rules, how many items went to tier 2 and why, how often the cardiologist upheld the rules on disagreements, and the spot-check agreement with its 95% interval. That interval estimates how many wrong labels tier 1 lets through. Report 09c gives PPV and NPV against the audited labels; with 50 reviewed positives, PPV is known to about ±0.1. `apply_to_labels` replaces the automatic labels of the audited women with the final ones, so training (Step 6) uses them. For outcomes, a reviewed label also marks the outcome observable. Risk tier is not recomputed from audited labels; it keeps its automatic value. The automatic audit reads notes for MACE and postpartum CVD only after the 7-day blanking period, and has no note rules for atypical presentation, so those items always go to a person.
 
-**Go when:** for every condition, PPV is at least 0.80, the spot-check passes (lower 95% bound at least `spot_check_target`) and nothing is pending (proposed limits; agree them before the audit). If PPV falls short, read the notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and audit a fresh sample. If the spot-check fails, set `tier1_per_item: 2` and audit again; if only the `auto` row fails, step the automatic tier 1 back from `replace` to `triage`, or from `triage` to `off`.
+**Go when:** for every condition and outcome label, PPV is at least 0.80, the spot-check passes (lower 95% bound at least `spot_check_target`) and nothing is pending (proposed limits; agree them before the audit). If PPV falls short, read the notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and audit a fresh sample. If the spot-check fails, set `tier1_per_item: 2` and audit again; if only the `auto` row fails, step the automatic tier 1 back from `replace` to `triage`, or from `triage` to `off`.
 
 ## Step 5 — Build the pre-training pool and pre-train from scratch
 
@@ -412,6 +413,7 @@ Goal: a written accept / reject decision based on the test reports, made once. T
 | Postpartum CVD | Accuracy ≥ 85% | Prefer AUROC and calibration; accuracy is inflated at low prevalence |
 | Atypical presentation | Sensitivity ≥ 80% | Same as sensitivity tasks |
 | FMD screening trigger | Sensitivity ≥ 95% | Same |
+| Risk tier | None in the form | Quadratic-weighted kappa with its CI, exact accuracy, and AUROC for High-or-Critical vs the rest; agree a limit with the clinical lead before the run |
 
 **Read `11_fairness.csv`.** PPCM false-negative rate and MACE AUROC for Black and non-Black women. A gap of more than 5 percentage points in PPCM FNR, or 0.05 in MACE AUROC (proposed limits; agree them before the run), is a reject reason or a reason to raise the fairness weight (`--fair-weight`, default 0.3) and rerun from Step 6.
 
