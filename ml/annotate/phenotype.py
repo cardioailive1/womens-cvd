@@ -40,7 +40,23 @@ QUESTION = {
     "TAKOTSUBO": "Takotsubo (stress) cardiomyopathy?",
     "CMD_INOCA": "Coronary microvascular dysfunction / INOCA (ischaemia without obstructive CAD)?",
     "FMD": "Fibromuscular dysplasia?",
+    # outcome labels (same review flow; sampled only among women whose outcome is observable)
+    "mace": "MI, stroke, heart failure needing admission or ED care, or death, from day 8 to 12 months after index?",
+    "postpartum_cvd": ("MI, stroke, heart failure, cardiomyopathy, SCAD, Takotsubo or PPCM from day 8 after "
+                       "index to 12 months after delivery?"),
+    "atypical": "ACS at index presenting WITHOUT chest pain (e.g. fatigue, nausea, dyspnoea, jaw/back/epigastric pain)?",
 }
+
+# Outcome labels that can be chart-reviewed like the conditions: label column y_<name>, mask
+# m_<name> (only women with the outcome observable are sampled), and the code groups whose
+# presence without a positive label makes a "near miss" negative.
+OUTCOMES_REVIEW = {
+    "mace": ["out_mi", "out_stroke", "out_heart_failure"],
+    "postpartum_cvd": ["out_mi", "out_stroke", "out_heart_failure", "out_cardiomyopathy",
+                       "cond_SCAD", "cond_TAKOTSUBO", "cond_PPCM"],
+    "atypical": ["sym_atypical"],
+}
+REVIEWABLE = list(C.CONDITION_ORDER) + list(OUTCOMES_REVIEW)
 
 
 def task_name(condition: str) -> str:
@@ -49,14 +65,21 @@ def task_name(condition: str) -> str:
 
 def sample_for_review(labels: pd.DataFrame, code_events: pd.DataFrame, conditions=None,
                       n_pos: int = 50, n_neg: int = 50, seed: int = 0) -> pd.DataFrame:
-    """-> person_id, condition, algo_label, stratum ('positive', 'near-miss negative', 'negative')."""
+    """-> person_id, condition, algo_label, stratum ('positive', 'near-miss negative', 'negative').
+
+    `conditions` may also name outcome labels (OUTCOMES_REVIEW: mace, postpartum_cvd, atypical);
+    pass REVIEWABLE to review all nine. Outcomes are sampled only where their mask is 1."""
     rng = np.random.default_rng(seed)
     conditions = conditions or C.CONDITION_ORDER
     rows = []
     for c in conditions:
-        y = labels.set_index("person_id")[f"y_{c}"]
+        lab = labels.set_index("person_id")
+        y = lab[f"y_{c}"]
+        if f"m_{c}" in lab:                                  # outcome not observable -> not reviewable
+            y = y[lab[f"m_{c}"] > 0]
         pos = y[y == 1].index.to_numpy()
-        coded = set(code_events.loc[code_events.grp == f"cond_{c}", "person_id"])
+        groups = OUTCOMES_REVIEW.get(c, [f"cond_{c}"])
+        coded = set(code_events.loc[code_events.grp.isin(groups), "person_id"])
         neg = y[y == 0].index
         near = np.array([p for p in neg if p in coded])
         far = np.array([p for p in neg if p not in coded])

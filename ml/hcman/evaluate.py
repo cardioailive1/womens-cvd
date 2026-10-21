@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+from sklearn.metrics import average_precision_score, brier_score_loss, cohen_kappa_score, roc_auc_score
 
 from mcp_adapter.concepts import CONDITION_ORDER
 
@@ -101,14 +101,57 @@ def evaluate(val: pd.DataFrame, test: pd.DataFrame, n_boot: int = 1000, seed: in
         if target is not None and not np.isnan(r.get(metric, np.nan)):
             r["meets_target"] = bool(r[metric] >= target)
         rows.append(r)
+    tier = tier_metrics(test, n_boot=n_boot, seed=seed)
+    if tier is not None:
+        rows.append(tier)
     out = pd.DataFrame(rows)
     # metrics computed on fewer than min_cell positives are not reported
     small = out.n_pos < min_cell
-    for c in ("auroc", "auprc", "sensitivity", "specificity", "ppv", "auroc_ci", "sensitivity_ci"):
+    for c in ("auroc", "auprc", "sensitivity", "specificity", "ppv", "auroc_ci", "sensitivity_ci",
+              "accuracy", "weighted_kappa", "weighted_kappa_ci"):
         if c in out:
             out[c] = out[c].astype(object); out.loc[small, c] = "suppressed (<%d positives)" % min_cell
     out["n_pos"] = out.n_pos.astype(object); out.loc[small, "n_pos"] = f"<{min_cell}"
+    for c in [c for c in out.columns if c.startswith("n_true_")]:
+        v = pd.to_numeric(out[c], errors="coerce")
+        out[c] = out[c].astype(object); out.loc[(v > 0) & (v < min_cell), c] = f"<{min_cell}"
     return out
+
+
+TIER_NAMES = ["Low", "Moderate", "High", "Critical"]
+
+
+def tier_metrics(test: pd.DataFrame, n_boot: int = 1000, seed: int = 0) -> dict | None:
+    """Risk tier (4 ordered classes) on women whose 12-month outcome is observable:
+    quadratic-weighted kappa (agreement that penalises being two tiers off more than one),
+    exact accuracy, and AUROC for High-or-Critical vs Low-or-Moderate. No form target."""
+    if "p_tier" not in test or "y_tier" not in test:
+        return None
+    d = test[test.m_tier > 0]
+    if d.empty:
+        return None
+    P = np.stack(d.p_tier.to_numpy())
+    y = d.y_tier.to_numpy().astype(int)
+    pred = P.argmax(1)
+    hi = (y >= 2).astype(int)
+    p_hi = P[:, 2:].sum(1)
+    kappa = cohen_kappa_score(y, pred, weights="quadratic", labels=list(range(4))) if len(np.unique(y)) > 1 else np.nan
+    r = {"task": "risk_tier", "target_metric": "weighted_kappa", "target": None,
+         "n": len(y), "n_pos": int(hi.sum()), "threshold": None,
+         "accuracy": float((pred == y).mean()), "weighted_kappa": kappa,
+         "auroc": roc_auc_score(hi, p_hi) if len(np.unique(hi)) == 2 else np.nan,
+         "auprc": average_precision_score(hi, p_hi) if len(np.unique(hi)) == 2 else np.nan}
+    rng = np.random.default_rng(seed)
+    ks = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(y), len(y))
+        if len(np.unique(y[i])) > 1:
+            ks.append(cohen_kappa_score(y[i], pred[i], weights="quadratic", labels=list(range(4))))
+    if ks:
+        r["weighted_kappa_ci"] = f"{np.percentile(ks, 2.5):.3f}-{np.percentile(ks, 97.5):.3f}"
+    for k, name in enumerate(TIER_NAMES):
+        r[f"n_true_{name.lower()}"] = int((y == k).sum())
+    return r
 
 
 def fairness_table(val: pd.DataFrame, test: pd.DataFrame, min_cell: int = 11) -> pd.DataFrame:

@@ -157,8 +157,9 @@ def test_echo_audit_end_to_end(tmp_path):
     assert json.loads(first["auto_value"])["view"] in E.VIEWS and first["frames"].ndim == 3
     n = 0
     while (c := scr.current()) is not None:
-        if n == 0:                       # pretend the rule mislabelled this clip: DS corrects to PSAX
-            scr.submit(verdict="disagree", view="PSAX", ed=1, es=8)
+        if n == 0:                       # pretend the rule mislabelled this clip: DS corrects the view
+            wrong = "PSAX" if json.loads(c["auto_value"])["view"] != "PSAX" else "PLAX"
+            scr.submit(verdict="disagree", view=wrong, ed=1, es=8)
         elif n == 1:
             scr.submit(verdict="uncertain")
         else:
