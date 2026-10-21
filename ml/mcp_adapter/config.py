@@ -61,6 +61,7 @@ class StudyConfig:
 
     report_sources: dict[str, dict] = field(default_factory=dict)
     audit: dict = field(default_factory=dict)
+    training: dict = field(default_factory=dict)
 
     pretrain: dict[str, int] = field(default_factory=lambda: {
         "max_women": 200000, "ecg_epochs": 30, "echo_epochs": 30, "ehr_epochs": 20,
@@ -112,6 +113,7 @@ class StudyConfig:
         )
         cfg.pretrain.update(pt)
         cfg.audit = raw.get("audit") or {}
+        cfg.training = raw.get("training") or {}
         cfg.report_sources = {k: v for k, v in (raw.get("reports") or {}).items()
                               if v and v.get("enabled", True)}
         for k, v in overrides.items():
