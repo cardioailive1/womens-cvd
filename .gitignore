@@ -11,3 +11,6 @@ coverage/
 .vscode/
 .idea/
 prisma/*.db
+
+# synthetic reviewer-training kit (rebuilt with annotate.synthetic_cases)
+ml/training_kit/

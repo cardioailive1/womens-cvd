@@ -12,7 +12,7 @@ flowchart LR
     S2 --> S2b["2b · Annotate + audit echo<br/>views + ED/ES"]
     S2b --> S3["3 · Feasibility<br/>Gate 1: enough cases"]
     S3 --> S4["4 · Study tables<br/>Gates 2, 3: imaging, sites"]
-    S4 --> S4a["4a · Train + qualify<br/>reviewers"] --> S4b["4b · Audit labels<br/>2 tiers · PPV / NPV"]
+    S4 --> S4a["4a · Qualify reviewers<br/>synthetic kit, off-platform"] --> S4b["4b · Audit labels<br/>2 tiers · PPV / NPV"]
     S4b --> S5["5 · Pre-train<br/>4 stages, no labels"]
     S5 --> S6["6 · Fine-tune<br/>ablation, then full"]
     S6 --> S7["7 · Evaluate<br/>accept or iterate"]
@@ -84,7 +84,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (62 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
+   Expect every test to pass (63 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -181,7 +181,7 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    ```
 
    Clips are decoded only once, so re-runs are quick. Repeat steps 2 and 3 until the queue is small. The queue always includes a fixed 5% sample of confidently auto-labelled clips, which measures how accurate the automatic labels are.
-4. **Audit (two tiers).** Every automatically labelled clip is audited before it is used. The auditors must first qualify in Step 4a, so run this audit after Step 4a; it only has to finish before training in Step 6. List the qualified auditors under `audit:` in `config/study.yaml`.
+4. **Audit (two tiers).** Every automatically labelled clip is audited before it is used. The auditors must first qualify on the synthetic training kit (Step 4a, done before workspace access). List the qualified auditors under `audit:` in `config/study.yaml`.
 
    ```python
    import sys; sys.path.insert(0, ".")
@@ -192,10 +192,7 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    from annotate.store import AnnotationStore
    cfg, WB = StudyConfig.load("config/study.yaml"), "/workbench"
    echo_store = AnnotationStore(f"{WB}/annot/echo.csv")
-   from annotate.training import exclude_training, load_training_sets
-   training = load_training_sets(f"{WB}/annot/training_sets.csv")    # Step 4a: keep training clips out
-   audit = LabelAudit.from_config(exclude_training(echo_audit_items(echo_store), training),
-                                  f"{WB}/annot/echo_audit.csv", cfg)
+   audit = LabelAudit.from_config(echo_audit_items(echo_store), f"{WB}/annot/echo_audit.csv", cfg)
 
    # optional automatic tier 1 (audit.auto_tier1: triage or replace); run before the data scientists start.
    # check_model: a view model retrained on the reviewed clips, not the one that made the labels.
@@ -276,21 +273,24 @@ Row-level tables land in `$WB/hcman_study/` and must stay there. Review each rep
 
 The clinical reviewer reads 04 for plausibility; the approver signs gates 2 and 3. If you change anything in the config, rebuild — the splits are seeded, so the same config always gives the same split.
 
-## Step 4a — Train and qualify the reviewers
+## Step 4a — Train and qualify the reviewers (synthetic kit, before workspace access)
 
-Goal: every data scientist and cardiologist who audits labels has completed the HCMAN Label Review Training Program and passed its qualification set. Run it once the study is built (Step 4) and the automatic echo pass has run (Step 2b, steps 1–3); both audits wait for it.
+Goal: every data scientist and cardiologist who audits labels has completed the HCMAN Label Review Training Program and passed its qualification set **before** they get workspace access. Training uses a synthetic kit, made-up records and cartoon echo clips with known answers, so it runs on a laptop and no patient data is involved. Nothing in this step happens inside the Mayo Clinic Platform workspace.
 
-Work through `notebooks/reviewer_training.ipynb` in the workspace:
+1. **Build the kit** on any machine with the repository installed (`pip install -r requirements.txt`):
 
-1. **Run owner draws the sets** with `annotate.training.draw_training_sets`: a reference set (40 records across the six conditions and three outcome labels, and 40 echo clips, split into halves A and B) and a practice pool (60 + 60). Sizes are under `training:` in `config/study.yaml`. The sets go to `$WB/annot/training_sets.csv`, and the live audits in Steps 2b and 4b leave them out with `exclude_training`.
-2. **Clinical lead writes the reference answers**, blinded, with a note on every item (`TrainingScreen(mode="reference")`). Set `training.lead` to their user name.
-3. **Trainees practise** on the practice pool. The screen shows the reference answer and the lead's note after each answer.
-4. **Trainees qualify** on half A with no feedback. Anyone who misses a mark reviews their errors with the lead and retakes once on half B.
-5. **Run owner scores** with `qualification_report`, and `pair_kappa` when two cardiologists adjudicate. Pass marks are under `training.pass_marks` (proposed: data scientists 18/20 views, 17/20 frames, 18/20 records with at most 2 Unsure; cardiologists 19/20 each; two cardiologists kappa ≥ 0.80).
+   ```bash
+   python -m annotate.synthetic_cases --out training_kit --config config/study.yaml
+   ```
 
-All training answers go to `$WB/annot/training.csv`, separate from the audit stores. During the live audit, each reviewer labels 10 reference items a month (`refresher_items`, `refresher_report`).
+   It writes 172 synthetic records across the six conditions and three outcome labels, 104 echo clips, the answer key with a teaching note on every answer, and a mock audit set whose automatic labels include planted errors (sizes under `training.kit_size`).
+2. **Clinical lead checks the key.** Any answer they change in `TrainingScreen(mode="reference")` overrides the generated one (set `training.lead` to their name).
+3. **Trainees work through `notebooks/reviewer_training.ipynb`:** practice with feedback; a mock two-tier audit on the same screens and automatic audit used in the workspace; then qualification on half A, with no feedback, and one retake on half B.
+4. **Run owner scores** with `qualification_report` (and `pair_kappa` when two cardiologists adjudicate). Pass marks are under `training.pass_marks` (proposed: data scientists 18/20 views, 17/20 frames, 18/20 records with at most 2 unnecessary Unsure answers; cardiologists 19/20 each; two cardiologists kappa ≥ 0.80).
 
-**Go when:** every reviewer listed under `audit:` has `passed = True` in `qualification_attempt1.csv` (or the retake), and the cardiologists' kappa meets the mark when there are two.
+The synthetic echo clips teach the review screen and how to mark end-diastole and end-systole, not what real views look like; view recognition is taught from real teaching images in the cardiologist-led session.
+
+**Go when:** every reviewer listed under `audit:` has `passed = True` (first attempt or retake), and the cardiologists' kappa meets the mark when there are two. Only then request their workspace accounts.
 
 ## Step 4b — Two-tier audit of the automatic condition and outcome labels
 
@@ -303,9 +303,7 @@ Goal: check the automatic condition labels against the records before training o
    from annotate.phenotype import sample_for_review, fetch_context, save_context
    ev = pd.read_pickle(f"{WB}/hcman_study/code_events.pkl")
    from annotate.phenotype import REVIEWABLE          # 6 conditions + mace, postpartum_cvd, atypical
-   from annotate.training import exclude_training, load_training_sets
    s = sample_for_review(t["labels"], ev, REVIEWABLE, n_pos=50, n_neg=50)
-   s = exclude_training(s, load_training_sets(f"{WB}/annot/training_sets.csv"))   # Step 4a women stay out
    s.to_csv(f"{WB}/annot/phenotype_sample.csv", index=False)
    save_context(fetch_context(be, cfg, t["cohort"], s.person_id), f"{WB}/annot/context.pkl")
    ```
@@ -535,7 +533,7 @@ Tick each item as it is done; write the run folder names and decisions next to t
 - [ ] Step 2b: annotated echo manifest set in `config/study.yaml`
 - [ ] Step 3: gate 1 signed (cases per condition); report 01b shows every lab found
 - [ ] Step 4: reports 02–06 reviewed; gate 2 (imaging coverage) and gate 3 (sites) signed
-- [ ] Step 4a: reference answers written; every listed auditor qualified; training sets excluded from the live audits
+- [ ] Step 4a: synthetic kit built and its key checked by the clinical lead; every listed auditor qualified before workspace access
 - [ ] Step 4b: condition-label audit done (report 09d spot-check passes, nothing pending); PPV meets the limit (report 09c); audited labels applied
 
 **Training**

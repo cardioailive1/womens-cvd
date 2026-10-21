@@ -1,4 +1,4 @@
-"""Reviewer training: reference set, practice feedback, qualification scoring."""
+"""Reviewer training on the synthetic kit: answer key, practice feedback, mock audit, qualification."""
 from __future__ import annotations
 
 import json
@@ -7,152 +7,148 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from annotate import echo as E
-from annotate.audit import ECHO_TASK
+from annotate.audit import ECHO_TASK, LabelAudit
 from annotate.store import AnnotationStore
-from annotate.training import (TrainingScreen, draw_training_sets, exclude_training, load_training_sets,
-                               marks_from_config, pair_kappa, qualification_items, qualification_report,
-                               refresher_items, save_training_sets)
-
-PERIOD = 16
+from annotate.synthetic_cases import KEY_AUTHOR, TEMPLATES, build_kit, main, sizes_from_config
+from annotate.training import (TrainingScreen, load_training_sets, marks_from_config, pair_kappa,
+                               qualification_items, qualification_report, reference_key, refresher_items,
+                               refresher_report)
 
 
 @pytest.fixture(scope="module")
-def world(tmp_path_factory):
-    from tests.test_annotate import make_clip, write_dicom
-    tmp = tmp_path_factory.mktemp("train")
-    rng = np.random.default_rng(0)
-    n = 300
-    conds = ["SCAD", "PPCM", "mace"]
-    labels = pd.DataFrame({"person_id": np.arange(n)})
-    for c in conds:
-        labels[f"y_{c}"] = rng.integers(0, 2, n).astype(float)
-    labels["m_mace"] = 1.0
-    ev = pd.DataFrame({"person_id": rng.choice(n, 80), "grp": rng.choice(["cond_SCAD", "cond_PPCM", "out_mi"], 80)})
-    ctx = {k: pd.DataFrame({"person_id": np.arange(n), "rel_day": 5, **cols})
-           for k, cols in {"diagnoses": {"code": "X", "name": "x"}, "procedures": {"code": "X", "name": "x"},
-                           "labs": {"name": "bnp", "value": 1.0, "unit": "pg/mL"},
-                           "notes": {"title": "note", "text": "text"}}.items()}
-    rows, truth = [], {}
-    for k in range(24):
-        v = ["PLAX", "PSAX", "A4C", "A2C"][k % 4]
-        fr, ed = make_clip(v, n=40, size=64, phase0=k % 5, seed=k)
-        p = tmp / f"c{k}.dcm"; write_dicom(p, fr, desc=v)
-        rows.append({"person_id": k, "record_date": "2020-01-01", "path": str(p)})
-        truth[E.item_id(str(p))] = (v, ed)
-    man = pd.DataFrame(rows)
-    echo_store = AnnotationStore(tmp / "echo.csv")
-    E.run_auto(man, echo_store, tmp / "cache")
-    sets = draw_training_sets(labels, ev, echo_store, man, n_reference=24, n_practice=12,
-                              n_echo_reference=16, n_echo_practice=8, conditions=conds)
-    return {"tmp": tmp, "labels": labels, "ev": ev, "ctx": ctx, "sets": sets, "truth": truth,
-            "cache": tmp / "cache", "man": man}
+def kit(tmp_path_factory):
+    out = tmp_path_factory.mktemp("kit")
+    r = build_kit(out, n_reference=36, n_practice=18, n_audit=36, n_echo_reference=10,
+                  n_echo_practice=5, n_echo_audit=10)
+    return {**r, "sets": load_training_sets(r["sets"]), "ctx": pd.read_pickle(r["context"])}
 
 
-def answer_key(world, item_id, task):
-    """The 'true' answer used by the simulated lead."""
-    if task == ECHO_TASK:
-        v, ed = world["truth"][item_id]
-        return {"view": v, "ed": ed, "es": ed + PERIOD // 2}
-    lab = world["labels"].set_index("person_id").loc[int(item_id), "y_" + task.split(":")[1]]
-    return {"value": "yes" if lab == 1 else "no"}
-
-
-def work(scr, world, wrong_every=0, unsure_every=0):
+def answer(scr, key, wrong_every=0):
+    """Answer every item in the screen's queue from the key, getting every `wrong_every`-th wrong."""
     n = 0
     while (c := scr.current()) is not None:
-        a = answer_key(world, c["item_id"], c["task"])
+        v, _ = key[(c["item_id"], c["task"])]
+        bad = wrong_every and n % wrong_every == 0
         if c["kind"] == "echo":
-            if wrong_every and n % wrong_every == 0:
-                a = {**a, "view": "OTHER" if a["view"] != "OTHER" else "A4C"}
-            scr.submit(view=a["view"], ed=a.get("ed"), es=a.get("es"), note="lead note" if scr.mode == "reference" else None)
+            x = json.loads(v)
+            if bad:
+                x["view"] = "OTHER" if x["view"] != "OTHER" else "A4C"
+                x["ed"], x["es"] = (2, 10) if x["view"] != "OTHER" else (None, None)
+            scr.submit(view=x["view"], ed=x["ed"], es=x["es"])
         else:
-            v = a["value"]
-            if unsure_every and n % unsure_every == 1:
-                v = "unsure"
-            elif wrong_every and n % wrong_every == 0:
-                v = {"yes": "no", "no": "yes"}[v]
-            scr.submit(value=v, note="lead note" if scr.mode == "reference" else None)
+            scr.submit(value={"yes": "no", "no": "yes", "unsure": "yes"}[v] if bad else v)
         n += 1
 
 
-def test_sets_are_balanced_and_excluded(world, tmp_path):
-    s = world["sets"]
-    assert (s.set == "reference").sum() == 24 + 16 and (s.set == "practice").sum() == 12 + 8
+def test_kit_contents(kit):
+    s, ctx = kit["sets"], kit["ctx"]
+    assert set(s.set) == {"practice", "reference", "audit"}
     ref = s[s.set == "reference"]
     for part in "AB":
         p = ref[ref.part == part]
-        assert set(p.task) >= {"phenotype:SCAD", "phenotype:PPCM", "phenotype:mace", ECHO_TASK}
-    save_training_sets(s, tmp_path / "sets.csv")
-    assert load_training_sets(tmp_path / "sets.csv").equals(s.astype({"item_id": str}))
-    from annotate.phenotype import sample_for_review
-    live = sample_for_review(world["labels"], world["ev"], ["SCAD", "PPCM", "mace"], n_pos=60, n_neg=60)
-    left = exclude_training(live, s)
-    assert not set(left.person_id.astype(str)) & set(s.item_id)
-    from annotate.audit import echo_audit_items
-    items = echo_audit_items(AnnotationStore(world["tmp"] / "echo.csv"), world["man"])
-    assert not set(exclude_training(items, s).item_id) & set(s.item_id)
+        assert {f"phenotype:{c}" for c in TEMPLATES} <= set(p.task) and (p.task == ECHO_TASK).any()
+    assert len(ref[ref.part == "A"]) == len(ref[ref.part == "B"])
+    key = reference_key(AnnotationStore(kit["store"]))
+    assert all((i, t) in key for i, t in zip(s.item_id, s.task))
+    answers = pd.Series([key[(i, t)][0] for i, t in zip(s.item_id, s.task) if t != ECHO_TASK])
+    assert set(answers) == {"yes", "no", "unsure"}
+    assert all(note for _, note in key.values())                                     # every answer has a lesson
+    assert ctx["notes"].text.str.contains("SYNTHETIC|spontaneous|LVEF", regex=True).any()
+    # the iatrogenic SCAD trap is in the kit: coded positive, answer No
+    audit = pd.read_csv(kit["audit_items"], dtype={"item_id": str})
+    scad = audit[audit.task == "phenotype:SCAD"]
+    assert any(key[(i, "phenotype:SCAD")][0] == "no" and a == "yes" for i, a in zip(scad.item_id, scad.auto_value))
 
 
-def test_full_training_flow(world, tmp_path):
-    s, store = world["sets"], AnnotationStore(tmp_path / "training.csv")
-    kw = dict(phenotype_context=world["ctx"], echo_cache=world["cache"], lead="dr_lead")
-    with pytest.raises(ValueError, match="reference answer"):
-        TrainingScreen(s, store, "ds_ana", "practice", **kw)            # lead has not written the key
+def test_practice_qualify_and_score(kit, tmp_path):
+    import shutil
+    store_path = tmp_path / "training.csv"; shutil.copy(kit["store"], store_path)
+    store, s = AnnotationStore(store_path), kit["sets"]
+    kw = dict(phenotype_context=kit["ctx"], echo_cache=kit["cache"])
 
-    work(TrainingScreen(s, store, "dr_lead", "reference", **kw), world)
-    assert TrainingScreen(s, store, "dr_lead", "reference", **kw).remaining() == 0
+    # the clinical lead overrides one generated answer
+    lead = TrainingScreen(s, store, "dr_lead", "reference", **kw)
+    first = lead.current()
+    assert lead.remaining() == len(s[s.set != "audit"])
+    if first["kind"] == "phenotype":
+        lead.submit(value="unsure", note="lead: borderline")
+        assert reference_key(store, "dr_lead")[(first["item_id"], first["task"])][0] == "unsure"
+    key = reference_key(store, "dr_lead")
 
-    # practice gives feedback after each answer
-    pr = TrainingScreen(s, store, "ds_ana", "practice", **kw)
+    pr = TrainingScreen(s, store, "ds_ana", "practice", lead="dr_lead", **kw)
     c = pr.current()
-    a = answer_key(world, c["item_id"], c["task"])
+    v, _ = key[(c["item_id"], c["task"])]
     if c["kind"] == "echo":
-        pr.submit(view="OTHER")
+        pr.submit(view="OTHER" if json.loads(v)["view"] != "OTHER" else "A4C", ed=1, es=9)
     else:
-        pr.submit(value={"yes": "no", "no": "yes"}[a["value"]])
+        pr.submit(value="yes" if v != "yes" else "no")
     f = pr.feedback()
-    assert f["match"] is False and f["lead_note"] == "lead note"
-    with pytest.raises(ValueError):
-        pr.submit(value="maybe") if pr.current()["kind"] == "phenotype" else pr.submit(view="A4C", ed=5, es=2)
+    assert f["match"] is False and f["lead_note"]
 
-    # qualification: one data scientist passes, one fails, then retakes part B
-    work(TrainingScreen(s, store, "ds_ana", "qualification", attempt=1, **kw), world)
-    work(TrainingScreen(s, store, "ds_ben", "qualification", attempt=1, **kw), world, wrong_every=3)
-    work(TrainingScreen(s, store, "dr_cole", "qualification", attempt=1, **kw), world)
-    work(TrainingScreen(s, store, "dr_dee", "qualification", attempt=1, **kw), world)
-    rep = qualification_report(store, s, {"ds_ana": "data_scientist", "ds_ben": "data_scientist",
-                                          "dr_cole": "cardiologist", "dr_dee": "cardiologist"},
-                               attempt=1, lead="dr_lead").set_index("trainee")
-    q1 = qualification_items(s, 1)
-    assert rep.at["ds_ana", "items"] == len(q1) and rep.at["ds_ana", "complete"]
-    assert rep.at["ds_ana", "passed"] and rep.at["dr_cole", "passed"]
-    assert not rep.at["ds_ben", "passed"]
-    k = pair_kappa(store, s, "dr_cole", "dr_dee", attempt=1)
-    assert k["kappa"] == 1.0 and k["items"] == len(q1)
+    who = {"ds_ana": "data_scientist", "ds_ben": "data_scientist", "dr_cole": "cardiologist", "dr_dee": "cardiologist"}
+    for name in who:
+        answer(TrainingScreen(s, store, name, "qualification", attempt=1, lead="dr_lead", **kw), key,
+               wrong_every=3 if name == "ds_ben" else 0)
+    rep = qualification_report(store, s, who, attempt=1, lead="dr_lead").set_index("trainee")
+    assert rep.at["ds_ana", "passed"] and rep.at["dr_cole", "passed"] and not rep.at["ds_ben", "passed"]
+    assert rep.at["ds_ana", "records_unsure"] == 0          # correct Unsure answers are not penalised
+    assert pair_kappa(store, s, "dr_cole", "dr_dee")["kappa"] == 1.0
+    answer(TrainingScreen(s, store, "ds_ben", "qualification", attempt=2, lead="dr_lead", **kw), key)
+    assert qualification_report(store, s, {"ds_ben": "data_scientist"}, attempt=2, lead="dr_lead").passed.iloc[0]
+    q1, q2 = qualification_items(s, 1), qualification_items(s, 2)
+    assert not set(zip(q1.item_id, q1.task)) & set(zip(q2.item_id, q2.task))
 
-    work(TrainingScreen(s, store, "ds_ben", "qualification", attempt=2, **kw), world)
-    rep2 = qualification_report(store, s, {"ds_ben": "data_scientist"}, attempt=2, lead="dr_lead")
-    assert rep2.passed.iloc[0]
-    q2 = qualification_items(s, 2)
-    assert not set(zip(q2.item_id, q2.task)) & set(zip(q1.item_id, q1.task))     # the retake is a fresh set
-
-    # monthly refresher: 10 items, different months differ
-    r1, r2 = refresher_items(s, 1), refresher_items(s, 2)
-    assert len(r1) == 10 and not r1.equals(r2)
-    scr = TrainingScreen(s, store, "ds_ana", "refresher", items=r1, month=1, **kw)
-    assert scr.remaining() == 10 and scr.feedback() is None
-    work(scr, world)
-    from annotate.training import refresher_report
-    rr = refresher_report(store, s, 1, ["ds_ana", "ds_ben"], lead="dr_lead").set_index("reviewer")
-    assert rr.at["ds_ana", "agreement"] == 1.0 and rr.at["ds_ben", "answered"] == 0
-    TrainingScreen(s, store, "ds_ana", "practice", **kw).show()                 # widgets build
+    items = refresher_items(s, 1)
+    answer(TrainingScreen(s, store, "ds_ana", "refresher", items=items, month=1, lead="dr_lead", **kw), key)
+    rr = refresher_report(store, s, 1, ["ds_ana"], lead="dr_lead")
+    assert rr.agreement.iloc[0] == 1.0
+    TrainingScreen(s, store, "ds_ben", "practice", lead="dr_lead", **kw).show()
 
 
-def test_marks_from_config():
+def test_mock_audit_rehearsal(kit, tmp_path):
+    """Trainees rehearse the real audit on the kit: automatic audit in triage mode, tier 1, tier 2."""
+    from annotate.audit_ui import AuditScreen
+    from annotate.auto_audit import audit_echo, audit_phenotypes
+    items = pd.read_csv(kit["audit_items"], dtype={"item_id": str})
+    key = reference_key(AnnotationStore(kit["store"]))
+    audit = LabelAudit(items, AnnotationStore(tmp_path / "mock_audit.csv"), ["ds_ana"], ["dr_cole"],
+                       spot_check_min=3, auto_tier1="triage")
+    pv = audit_phenotypes(items, kit["ctx"])
+    ev = audit_echo(items[items.task == ECHO_TASK], AnnotationStore(kit["echo_store"]), kit["cache"])
+    audit.submit_auto(pd.concat([pv, ev], ignore_index=True))
+    ph = items[items.task != ECHO_TASK]
+    wrong = {i for i, t, a in zip(ph.item_id, ph.task, ph.auto_value) if key[(i, t)][0] != a}
+    flagged = set(pv[pv.verdict != "agree"].item_id)
+    assert len(wrong & flagged) / len(wrong) >= 0.7          # the automatic audit flags most planted errors
+    q = audit.tier1_queue("ds_ana")
+    assert 0 < len(q) < len(items)
+    scr = AuditScreen(audit, "ds_ana", tier=1, phenotype_context=kit["ctx"], echo_cache=kit["cache"])
+    assert scr.current().get("auto_audit")
+    while (c := scr.current()) is not None:
+        gold, _ = key[(c["item_id"], c["task"])]
+        if c["kind"] == "echo":
+            ok = json.loads(gold)["view"] == json.loads(c["auto_value"])["view"]
+            scr.submit(verdict="agree") if ok else scr.submit(verdict="uncertain")
+        elif gold == "unsure":
+            scr.submit(verdict="uncertain")
+        else:
+            scr.submit(verdict="agree" if gold == c["auto_value"] else "disagree")
+    card = AuditScreen(audit, "dr_cole", tier=2, phenotype_context=kit["ctx"], echo_cache=kit["cache"])
+    while (c := card.current()) is not None:
+        gold, _ = key[(c["item_id"], c["task"])]
+        if c["kind"] == "echo":
+            g = json.loads(gold); card.submit(view=g["view"], ed=g["ed"], es=g["es"])
+        else:
+            card.submit(value=gold)
+    rep = audit.report(min_cell=1)
+    assert set(rep.tier1_by) == {"auto", "human"}
+
+
+def test_cli_and_config(tmp_path):
     from pathlib import Path
     from mcp_adapter.config import StudyConfig
     cfg = StudyConfig.load(Path(__file__).resolve().parents[1] / "config/study.yaml")
-    m = marks_from_config(cfg)
-    assert m["data_scientist"]["echo_frames"] == 17 and m["cardiologist_pair_kappa"] == 0.80
-    assert cfg.training["reference_size"]["records"] == 40
+    assert sizes_from_config(cfg)["n_reference"] == 40 and marks_from_config(cfg)["data_scientist"]["echo_frames"] == 17
+    main(["--out", str(tmp_path / "k"), "--seed", "1"])
+    assert (tmp_path / "k" / "sets.csv").exists() and (tmp_path / "k" / "README.txt").read_text().startswith("SYNTHETIC")
+    assert KEY_AUTHOR in set(pd.read_csv(tmp_path / "k" / "training.csv").annotator)

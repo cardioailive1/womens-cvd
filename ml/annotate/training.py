@@ -1,24 +1,26 @@
-"""Reviewer training: reference set, practice pool, qualification and scoring.
+"""Reviewer training on the SYNTHETIC kit: practice, qualification and scoring, on a laptop.
 
-Implements the practice and qualification parts of the HCMAN Label Review Training Program.
-Everything runs inside the workspace, because the sets are real de-identified records.
+Reviewers practise before they get workspace access, on made-up records and cartoon echo clips
+with known answers (annotate.synthetic_cases). No patient data is involved, so this runs anywhere
+the repository runs (local JupyterLab), never inside the Mayo Clinic Platform workspace.
 
-  1. draw   — the run owner draws a REFERENCE set (default 40 condition/outcome records and 40
-              echo clips) and a PRACTICE pool (default 60 + 60) with `draw_training_sets`.
-              Both are kept out of the live audit with `exclude_training`.
-  2. key    — the clinical lead labels both sets, blinded, in `TrainingScreen(mode="reference")`.
-              Those answers are the reference answers.
-  3. learn  — trainees work the practice pool in `TrainingScreen(mode="practice")`; after each
-              answer the screen shows the reference answer and the lead's note.
-  4. qualify — trainees label half of the reference set (part A; part B is the retake) in
-              `TrainingScreen(mode="qualification", attempt=1)`, with no feedback.
-  5. score  — `qualification_report` scores each trainee against the pass marks in
-              config/study.yaml (`training:`), and `pair_kappa` checks two cardiologists agree.
+  1. build   — `python -m annotate.synthetic_cases --out training_kit` writes the kit: the cases,
+               the answer key (each answer with a teaching note) and a mock audit set.
+  2. check   — the clinical lead reads the key; any answer they relabel in
+               `TrainingScreen(mode="reference")` overrides the generated one.
+  3. learn   — trainees work the practice set in `TrainingScreen(mode="practice")`; after each
+               answer the screen shows the key's answer and its teaching note.
+  4. audit   — trainees rehearse the real two-tier audit on the mock audit set (the same
+               LabelAudit and AuditScreen used in the workspace, with the automatic audit).
+  5. qualify — trainees label half of the reference set (part A; part B is the retake) in
+               `TrainingScreen(mode="qualification", attempt=1)`, with no feedback.
+  6. score   — `qualification_report` scores each trainee against the pass marks in
+               config/study.yaml (`training:`); `pair_kappa` checks two cardiologists agree.
 
-All answers go to their own append-only store (e.g. $WB/annot/training.csv), never the live
-audit store. Tasks are prefixed ref: / practice: / qual1: / qual2: / refresh:.
+Answers go to the kit's own store (training_kit/training.csv). Tasks are prefixed
+ref: / practice: / qual1: / qual2: / refresh<month>:.
 
-    from annotate.training import draw_training_sets, exclude_training, TrainingScreen, qualification_report
+    from annotate.training import TrainingScreen, load_training_sets, qualification_report
 """
 from __future__ import annotations
 
@@ -30,9 +32,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .audit import ECHO_TASK, FRAME_TOLERANCE, echo_audit_items, echo_value, same
+from .audit import ECHO_TASK, FRAME_TOLERANCE, echo_value, same
 from .echo import VIEWS, cavity_signal, read_clip
-from .phenotype import QUESTION, REVIEWABLE, sample_for_review, task_name
+from .phenotype import QUESTION
+from .synthetic_cases import KEY_AUTHOR
 from .store import AnnotationStore
 
 MODES = ("reference", "practice", "qualification", "refresher")
@@ -45,58 +48,7 @@ DEFAULT_MARKS = {
 }
 
 
-# ------------------------------------------------------------------ 1. draw
-def draw_training_sets(labels: pd.DataFrame | None = None, code_events: pd.DataFrame | None = None,
-                       echo_store: AnnotationStore | None = None, manifest: pd.DataFrame | None = None,
-                       n_reference: int = 40, n_practice: int = 60, n_echo_reference: int = 40,
-                       n_echo_practice: int = 60, conditions=None, seed: int = 0) -> pd.DataFrame:
-    """-> item_id, task, set ('reference' | 'practice'), part ('A' | 'B' for the reference halves).
-    Condition/outcome records come from the built study's labels and code events; echo clips
-    from the automatic echo annotations. Each label and view is spread over both sets and both
-    reference halves."""
-    rng = np.random.default_rng(seed)
-    parts = []
-    if labels is not None and code_events is not None:
-        conds = list(conditions or REVIEWABLE)
-        k = math.ceil((n_reference + n_practice) / (2 * len(conds))) + 1
-        s = sample_for_review(labels, code_events, conds, n_pos=k, n_neg=k, seed=seed)
-        s = s.assign(item_id=s.person_id.astype(str), task=[task_name(c) for c in s.condition])
-        parts.append(_split(s[["item_id", "task"]], s.task, n_reference, n_practice, rng))
-    if echo_store is not None:
-        e = echo_audit_items(echo_store, manifest)
-        if len(e):
-            view = e.auto_value.map(lambda v: json.loads(v)["view"])
-            parts.append(_split(e[["item_id", "task"]], view, n_echo_reference, n_echo_practice, rng))
-    if not parts:
-        raise ValueError("give labels + code_events, an echo_store, or both")
-    return pd.concat(parts, ignore_index=True)
-
-
-def _split(items: pd.DataFrame, strata: pd.Series, n_ref: int, n_prac: int, rng) -> pd.DataFrame:
-    """Round-robin over strata so every label or view reaches both sets and both halves."""
-    groups = [list(rng.permutation(g.index)) for _, g in items.groupby(strata.values)]
-    order = []
-    while any(groups):
-        for g in groups:
-            if g:
-                order.append(g.pop())
-    order = order[:n_ref + n_prac]
-    ref, prac = order[:n_ref], order[n_ref:]
-    out = items.loc[ref + prac].copy()
-    out["set"] = ["reference"] * len(ref) + ["practice"] * len(prac)
-    out["part"] = [("A" if i % 2 == 0 else "B") for i in range(len(ref))] + [""] * len(prac)
-    return out.reset_index(drop=True)
-
-
-def exclude_training(live: pd.DataFrame, training: pd.DataFrame) -> pd.DataFrame:
-    """Drop training women and clips from a live audit sample or item list. Works on the output
-    of sample_for_review (person_id) and on audit items (item_id). Women are dropped from every
-    label, so nobody meets a training record again in the live queue."""
-    ids = set(training.item_id.astype(str))
-    key = live.person_id.astype(str) if "person_id" in live else live.item_id.astype(str)
-    return live[~key.isin(ids)].reset_index(drop=True)
-
-
+# ------------------------------------------------------------------ sets
 def save_training_sets(sets: pd.DataFrame, path) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     sets.to_csv(path, index=False)
@@ -129,9 +81,12 @@ def answers(store: AnnotationStore, mode: str, attempt: int | None = None,
 
 
 def reference_key(store: AnnotationStore, lead: str | None = None) -> dict:
-    """(item_id, task) -> (value, note) from the clinical lead's reference answers."""
-    ref = answers(store, "reference", annotator=lead)
-    return {(r.item_id, r.task): (r.value, r.note) for r in ref.itertuples()}
+    """(item_id, task) -> (value, note): the kit's generated answer, overridden by any answer the
+    clinical lead (`lead`) gave the same item in mode="reference"."""
+    ref = answers(store, "reference")
+    ref = ref[ref.annotator.isin([KEY_AUTHOR] + ([lead] if lead else []))]
+    ref = ref.assign(_lead=(ref.annotator != KEY_AUTHOR).astype(int)).sort_values("_lead", kind="stable")
+    return {(r.item_id, r.task): (r.value, r.note) for r in ref.groupby(["item_id", "task"]).tail(1).itertuples()}
 
 
 def qualification_items(sets: pd.DataFrame, attempt: int) -> pd.DataFrame:
@@ -158,7 +113,7 @@ class TrainingScreen:
     """Blinded labelling screen for every training mode. Logic lives in current / submit /
     skip / feedback; show() wires them to widgets.
 
-    reference      the clinical lead labels the reference set and practice pool
+    reference      the clinical lead checks the key; their answer overrides the generated one
     practice       trainees; after each answer `feedback()` returns the reference answer + note
     qualification  trainees, attempt 1 (part A) or 2 (part B); no feedback
     refresher      trainees, a monthly 10 (pass `items=refresher_items(sets, month)`), no feedback
@@ -173,7 +128,7 @@ class TrainingScreen:
         self.mode, self.annotator, self.lead = mode, annotator, lead
         self.attempt = attempt if mode == "qualification" else (month if mode == "refresher" else None)
         if mode == "reference":
-            pool = sets
+            pool = sets[sets.set != "audit"]
         elif mode == "practice":
             pool = sets[sets.set == "practice"]
         elif mode == "qualification":
@@ -186,8 +141,8 @@ class TrainingScreen:
             key = reference_key(self.store, lead)
             missing = [(i, t) for i, t in zip(pool.item_id, pool.task) if (i, t) not in key]
             if missing:
-                raise ValueError(f"{len(missing)} items have no reference answer yet; "
-                                 "the clinical lead finishes mode='reference' first")
+                raise ValueError(f"{len(missing)} items have no answer in the key; "
+                                 "rebuild the kit with annotate.synthetic_cases")
         if isinstance(phenotype_context, (str, Path)):
             phenotype_context = pd.read_pickle(phenotype_context)
         self.ctx = phenotype_context
@@ -275,7 +230,7 @@ class TrainingScreen:
              for v in PHENO_ANSWERS}
         b_save, b_skip = W.Button(description="Save and next", button_style="primary"), W.Button(description="Skip")
         box, st = W.VBox(), {}
-        titles = {"reference": "Reference answers (clinical lead)", "practice": "Practice: feedback after each answer",
+        titles = {"reference": "Answer key check (clinical lead)", "practice": "Practice: feedback after each answer",
                   "qualification": f"Qualification, attempt {self.attempt}: no feedback",
                   "refresher": "Monthly refresher: no feedback"}
 
@@ -365,7 +320,7 @@ def score(store: AnnotationStore, sets: pd.DataFrame, trainee: str, role: str, a
     pv = [(got[(i, t)], key[(i, t)][0]) for i, t in zip(ph.item_id, ph.task) if (i, t) in got]
     out["records_items"] = len(ph)
     out["records_agree"] = sum(a == b for a, b in pv)
-    out["records_unsure"] = sum(a == "unsure" for a, _ in pv)
+    out["records_unsure"] = sum(a == "unsure" and b != "unsure" for a, b in pv)   # Unsure where the key is definite
     full = lambda n, k: n * len_scale(k, m["qualification_size"])   # marks are written out of 20
     if role == "data_scientist":
         r = m["data_scientist"]
