@@ -116,6 +116,20 @@ audit:
   auto_tier1: "off"
   auto_spot_check_fraction: 0.20   # share of auto-accepted items re-labelled blind (at least spot_check_min)
 
+training:
+  # Reviewer training on the SYNTHETIC kit (annotate.synthetic_cases + annotate.training), run on a
+  # laptop before workspace access; no patient data. Proposed marks: the clinical lead confirms them.
+  lead: null                       # optional: the clinical lead's name; their answers override the generated key
+  kit_size:                        # records span the six conditions and three outcome labels
+    reference: {records: 40, echo: 40}       # half is qualification attempt 1, half the retake
+    practice: {records: 60, echo: 40}
+    mock_audit: {records: 72, echo: 24}
+  qualification_size: 20           # items per kind per attempt; the marks below are out of this
+  pass_marks:
+    data_scientist: {echo_view: 18, echo_frames: 17, phenotype: 18, phenotype_max_unsure: 2}
+    cardiologist: {echo: 19, phenotype: 19}
+    cardiologist_pair_kappa: 0.80
+
 sampling:
   # Minimum targets from the Model Details Form; the feasibility query decides real N.
   stratum_targets:

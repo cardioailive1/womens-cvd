@@ -12,7 +12,7 @@ flowchart LR
     S2 --> S2b["2b · Annotate + audit echo<br/>views + ED/ES"]
     S2b --> S3["3 · Feasibility<br/>Gate 1: enough cases"]
     S3 --> S4["4 · Study tables<br/>Gates 2, 3: imaging, sites"]
-    S4 --> S4b["4b · Audit labels<br/>2 tiers · PPV / NPV"]
+    S4 --> S4a["4a · Qualify reviewers<br/>synthetic kit, off-platform"] --> S4b["4b · Audit labels<br/>2 tiers · PPV / NPV"]
     S4b --> S5["5 · Pre-train<br/>4 stages, no labels"]
     S5 --> S6["6 · Fine-tune<br/>ablation, then full"]
     S6 --> S7["7 · Evaluate<br/>accept or iterate"]
@@ -84,7 +84,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (59 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
+   Expect every test to pass (63 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -181,7 +181,7 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    ```
 
    Clips are decoded only once, so re-runs are quick. Repeat steps 2 and 3 until the queue is small. The queue always includes a fixed 5% sample of confidently auto-labelled clips, which measures how accurate the automatic labels are.
-4. **Audit (two tiers).** Every automatically labelled clip is audited before it is used. List the auditors under `audit:` in `config/study.yaml` first.
+4. **Audit (two tiers).** Every automatically labelled clip is audited before it is used. The auditors must first qualify on the synthetic training kit (Step 4a, done before workspace access). List the qualified auditors under `audit:` in `config/study.yaml`.
 
    ```python
    import sys; sys.path.insert(0, ".")
@@ -272,6 +272,25 @@ Row-level tables land in `$WB/hcman_study/` and must stay there. Review each rep
 | 06_definitions | Code lists and feature provenance used in this run | Differs from the signed-off concept lists |
 
 The clinical reviewer reads 04 for plausibility; the approver signs gates 2 and 3. If you change anything in the config, rebuild — the splits are seeded, so the same config always gives the same split.
+
+## Step 4a — Train and qualify the reviewers (synthetic kit, before workspace access)
+
+Goal: every data scientist and cardiologist who audits labels has completed the HCMAN Label Review Training Program and passed its qualification set **before** they get workspace access. Training uses a synthetic kit, made-up records and cartoon echo clips with known answers, so it runs on a laptop and no patient data is involved. Nothing in this step happens inside the Mayo Clinic Platform workspace.
+
+1. **Build the kit** on any machine with the repository installed (`pip install -r requirements.txt`):
+
+   ```bash
+   python -m annotate.synthetic_cases --out training_kit --config config/study.yaml
+   ```
+
+   It writes 172 synthetic records across the six conditions and three outcome labels, 104 echo clips, the answer key with a teaching note on every answer, and a mock audit set whose automatic labels include planted errors (sizes under `training.kit_size`).
+2. **Clinical lead checks the key.** Any answer they change in `TrainingScreen(mode="reference")` overrides the generated one (set `training.lead` to their name).
+3. **Trainees work through `notebooks/reviewer_training.ipynb`:** practice with feedback; a mock two-tier audit on the same screens and automatic audit used in the workspace; then qualification on half A, with no feedback, and one retake on half B.
+4. **Run owner scores** with `qualification_report` (and `pair_kappa` when two cardiologists adjudicate). Pass marks are under `training.pass_marks` (proposed: data scientists 18/20 views, 17/20 frames, 18/20 records with at most 2 unnecessary Unsure answers; cardiologists 19/20 each; two cardiologists kappa ≥ 0.80).
+
+The synthetic echo clips teach the review screen and how to mark end-diastole and end-systole, not what real views look like; view recognition is taught from real teaching images in the cardiologist-led session.
+
+**Go when:** every reviewer listed under `audit:` has `passed = True` (first attempt or retake), and the cardiologists' kappa meets the mark when there are two. Only then request their workspace accounts.
 
 ## Step 4b — Two-tier audit of the automatic condition and outcome labels
 
@@ -514,6 +533,7 @@ Tick each item as it is done; write the run folder names and decisions next to t
 - [ ] Step 2b: annotated echo manifest set in `config/study.yaml`
 - [ ] Step 3: gate 1 signed (cases per condition); report 01b shows every lab found
 - [ ] Step 4: reports 02–06 reviewed; gate 2 (imaging coverage) and gate 3 (sites) signed
+- [ ] Step 4a: synthetic kit built and its key checked by the clinical lead; every listed auditor qualified before workspace access
 - [ ] Step 4b: condition-label audit done (report 09d spot-check passes, nothing pending); PPV meets the limit (report 09c); audited labels applied
 
 **Training**
