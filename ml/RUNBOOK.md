@@ -97,7 +97,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (64 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
+   Expect every test to pass (66 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -369,6 +369,8 @@ Goal: check the automatic condition labels against the records before training o
    ```
 
    Report 09d gives, per condition: tier-1 agreement with the rules, how many items went to tier 2 and why, how often the cardiologist upheld the rules on disagreements, and the spot-check agreement with its 95% interval. That interval estimates how many wrong labels tier 1 lets through. Report 09c gives PPV and NPV against the audited labels; with 50 reviewed positives, PPV is known to about ±0.1. `apply_to_labels` replaces the automatic labels of the audited women with the final ones, so training (Step 6) uses them. For outcomes, a reviewed label also marks the outcome observable. Risk tier is not recomputed from audited labels; it keeps its automatic value. The automatic audit reads notes for MACE and postpartum CVD only after the 7-day blanking period, and has no note rules for atypical presentation, so those items always go to a person.
+
+**Optional MACE rule.** If the clinical lead wants MI and stroke counted only when they are a primary diagnosis, set `outcomes.mace_primary_diagnosis.mode: fact_diagnosis` in `config/study.yaml`. First fill in the `FACT_DIAGNOSIS` column names from MCP, then rebuild Step 4. Report `04b_mace_primary_diagnosis` shows how many MI and stroke codes were dropped. Compare MACE PPV in report 09c with the rule off and on before choosing; the rule removes history-of and rule-out codes but can miss real events coded as secondary.
 
 **Go when:** for every condition and outcome label, PPV is at least 0.80, the spot-check passes (lower 95% bound at least `spot_check_target`) and nothing is pending (proposed limits; agree them before the audit). If PPV falls short, read the notes, tighten that rule in `mcp_adapter/concepts.py` or `mcp_adapter/labels.py` (for SCAD, for example, exclude dissection codes within 2 days after a cardiac catheterisation), rebuild Step 4 and audit a fresh sample. If the spot-check fails, set `tier1_per_item: 2` and audit again; if only the `auto` row fails, step the automatic tier 1 back from `replace` to `triage`, or from `triage` to `off`.
 

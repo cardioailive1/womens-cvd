@@ -94,6 +94,16 @@ def build_study(be: Backend, cfg: StudyConfig, out_dir: str | Path) -> dict[str,
     tokens = Q.cohort_ehr_tokens(be, cfg)
     tox = Q.cohort_cardiotoxic_drugs(be, cfg)
 
+    if (cfg.mace_primary or {}).get("mode", "off") == "fact_diagnosis":
+        from .labels import require_primary
+        mp = cfg.mace_primary
+        ev, dropped = require_primary(ev, Q.primary_diagnoses(be, cfg),
+                                      tuple(mp.get("applies_to", ["out_mi", "out_stroke"])),
+                                      int(mp.get("match_days", 1)))
+        write_report(suppress(pd.DataFrame([{"item": "MI / stroke codes dropped: not a primary diagnosis",
+                                             "n": dropped}]), ["n"], cfg.min_cell_size),
+                     "04b_mace_primary_diagnosis", cfg.report_dir)
+        log.info("MACE primary-diagnosis rule: %d MI / stroke codes dropped", dropped)
     labels = build_labels(ev, cohort, cfg)
     repro = build_repro(ev, cohort, tox)
     split = make_splits(cohort, labels, cfg).rename("split").reset_index()
