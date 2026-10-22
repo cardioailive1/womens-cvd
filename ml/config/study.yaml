@@ -40,23 +40,40 @@ platform:
   # OMOP person column holding the (de-identified) clinic number.
   person_map:
     clinic_number_column: person_source_value   # TODO(MCP): confirm this mapping
-  # Only if ECG waveforms are stored as encoded strings in a table (to confirm with MCP).
+  # Mayo patient dimension: one row per PATIENT_DK (per medical-record system). PATIENT_CLINIC_NUMBER
+  # is the same person across systems (MCP, 21 Oct 2026), so it is the person-level key; one row
+  # per person is PATIENT_MERGED_FLAG = 'N'.
+  dim_patient:
+    table: DIM_PATIENT               # TODO(MCP): add the schema prefix if needed
+    dk_column: PATIENT_DK
+    clinic_number_column: PATIENT_CLINIC_NUMBER
+    merged_flag_column: PATIENT_MERGED_FLAG
+    merged_flag_current: "N"
+  # ECG waveforms are encoded strings in FACT_ECG_WAVEFORM (MCP, 21 Oct 2026): one URL-encoded
+  # Base64 record per lead, signed 16-bit little-endian counts x 4.88 = microvolts; leads I, II,
+  # V1-V6 (III, aVR, aVL, aVF are derived); WAVEFORM_TYPE 'Rhythm' = the full 10 s (not 'Median').
+  # Records are not ordered chunks, so they are never concatenated. Sampling rate (250 or 500 Hz)
+  # from FACT_ECG_WAVEFORM_RESTING_MEASUREMENT.ECGSAMPLEBASE. To join FACT_ECG (measurements,
+  # interpretation): PATIENT_DK via DIM_PATIENT, ACQUISITION_TS = ECG_DTM.
   # `python -m mcp_adapter.imaging_sources ecg` converts them to files + a manifest.
   ecg_table:
-    table: null                  # TODO(MCP)
-    format: muse_xml             # muse_xml (one row per ECG, XML text or base64 of it) | lead_base64
-    person_column: null
-    date_column: null
-    id_column: null              # one ECG
-    waveform_column: null
-    lead_column: null            # lead_base64 only
-    sample_rate: 500             # lead_base64 only, unless sample_rate_column is set
-    units_per_bit: 4.88          # lead_base64 only (microvolts per stored unit)
+    table: FACT_ECG_WAVEFORM         # TODO(MCP): add the schema prefix if needed
+    format: mayo_waveform            # mayo_waveform | muse_xml | lead_base64
+    person_column: PATIENT_DK        # joined to DIM_PATIENT, then to OMOP through person_map
+    date_column: ACQUISITION_TS      # one acquisition = PATIENT_DK + ACQUISITION_TS
+    waveform_column: WAVEFORM
+    lead_column: LEAD_ID
+    type_column: WAVEFORM_TYPE
+    rhythm_value: Rhythm
+    url_encoded: true
+    units_per_bit: 4.88              # counts -> microvolts
+    sample_rate_table: FACT_ECG_WAVEFORM_RESTING_MEASUREMENT   # TODO(MCP): schema prefix
+    sample_rate_column: ECGSAMPLEBASE
+    sample_rate_keys: [PATIENT_DK, ACQUISITION_TS]   # TODO(MCP): confirm the join keys
   ecg_source:
-    kind: muse_xml_dir           # muse_xml_dir | dicom_ecg | npy_dir
-    path: null                   # TODO(MCP): root folder of ECG files (manifest paths are relative to it)
-    manifest: null               # TODO(MCP): "sql:<schema.table>" or a .csv/.parquet with
-                                 #   person_id, record_date, path
+    kind: npy_dir                # the .npz files written by `imaging_sources ecg`
+    path: null                   # set to the extraction output folder (e.g. $WB/ecg_npz)
+    manifest: null               # its manifest.csv
   echo_source:
     kind: dicom_dir              # dicom_dir | npy_dir
     path: null                   # TODO(MCP): root folder of echo DICOM cine files

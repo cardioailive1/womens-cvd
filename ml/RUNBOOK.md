@@ -36,7 +36,7 @@ You need seven things in place before any code runs in the workbench; the code-r
 | Export rules | The official small-cell threshold and the approval path for aggregate reports and model weights | Mayo Clinic Platform |
 | Clinical sign-off | Cardiologist review of the code lists in `ml/mcp_adapter/concepts.py` | Cardio AI clinical lead |
 | Annotators | Up to 5 extra workspace seats for outside readers (confirmed). Mayo Clinic staff cannot annotate in your environment, so hire cardiologists or sonographers; each needs a `cardioailive.com` email and goes through the same onboarding as every data user, including a [DUA form submission](https://app.smartsheet.com/b/form/019a16c42ac777d8880713d7e7e8b8ff) | Cardio AI, then MCP to issue seats |
-| Imaging data | DICOM files are not in a table: every instance is catalogued in `FACT_RADIOLOGY_DICOM_INVENTORY` and must be requested (confirmed; columns from the MCP Radiology deck are already in `config/study.yaml`). Still needed: the request process and where delivered files land; that OMOP `person.person_source_value` holds the `PATIENT_CLINIC_NUMBER`; the date and patient columns of `FACT_ECHO_TEST`; and whether ECG waveforms are DICOM files or encoded strings in a table | MCP technical mentor |
+| Imaging data | DICOM files are not in a table: every instance is catalogued in `FACT_RADIOLOGY_DICOM_INVENTORY` and must be requested (confirmed; columns from the MCP Radiology deck are already in `config/study.yaml`). ECG storage is confirmed (`FACT_ECG_WAVEFORM`, 21 Oct). Still needed: where delivered DICOM files land; which OMOP column (or mapping) holds the `PATIENT_CLINIC_NUMBER`; the date column of `FACT_ECHO_TEST` and the LVEF column of `FACT_ECHO_RESULTS`; and the join keys of `FACT_ECG_WAVEFORM_RESTING_MEASUREMENT` | MCP technical mentor |
 
 **Roles for the run:**
 
@@ -50,6 +50,19 @@ Everyone who audits needs a workspace account and DUA, and is listed by user nam
 - **Approver** — decides go / no-go at the three gates (Steps 3–4) and accepts the model (Step 7).
 
 **What MCP confirmed (14-15 Oct 2026):** `pip install` works in the workspace; local web apps can run on localhost; Docker containers run but cannot pull images, so they must be self-contained; a remote desktop with 3D Slicer and ITK-SNAP is already installed. There are no existing image annotations on the platform; labels come from radiology reports and echo notes. Public datasets should stay outside the environment unless essential. DICOM images are requested through `FACT_RADIOLOGY_DICOM_INVENTORY`. A self-contained Docker image saved as a tar file is imported the same way as other files. GPUs are assigned automatically when available. From the Radiology deck: the inventory has one row per DICOM instance, keyed by `PATIENT_CLINIC_NUMBER` and `STUDY_INSTANCE_UID`; only instances with `IMAGE_DEID_STATUS` Ready or Available can be requested; images link to reports through `DICOM_ACCESSION_NUMBER` = `FACT_RADIOLOGY.ACCESSION_NBR`; radiology reports are also in the OMOP `note` table; the inventory itself is not in OMOP.
+
+**What MCP confirmed (21 Oct 2026):**
+- **ECGs** are encoded strings in `FACT_ECG_WAVEFORM`, not DICOM. Each record is a URL-encoded Base64 value that decodes on its own to signed 16-bit little-endian counts; × 4.88 gives microvolts. Records are not ordered pieces of one recording, so the code never joins them end to end.
+- **Leads:** eight are stored (I, II, V1–V6); the code derives III, aVR, aVL and aVF from I and II.
+- **Waveform type:** use `WAVEFORM_TYPE = 'Rhythm'` (the full 10 s); 'Median' is a synthesized representative beat.
+- **Sampling rate** (250 or 500 Hz) is `ECGSAMPLEBASE` in `FACT_ECG_WAVEFORM_RESTING_MEASUREMENT`.
+- **Linking ECGs to `FACT_ECG`:** go through `DIM_PATIENT` to `PATIENT_DK`, then match `ACQUISITION_TS` to `ECG_DTM`; `ECG_WAVEFORM_FPK` does not join to `ECG_FPK`.
+- **Patients:** `PATIENT_CLINIC_NUMBER` identifies a person across medical-record systems. `DIM_PATIENT` has one row per system; `PATIENT_MERGED_FLAG = 'N'` gives one row per person.
+- **Dates** are shifted by the same amount across a patient's whole record.
+- **Echo images** link to `FACT_ECHO_TEST` by date and `PATIENT_CLINIC_NUMBER`.
+- **Cause of death** is not populated, so MACE uses all-cause death (MCP's recommendation).
+- **Mortality:** `FACT_MORTALITY_STATUS` combines the Mayo record with third-party mortality data. Its last live interaction is a completed appointment, an immunization, a lab collection or a surgical case.
+- **Diagnoses:** they are in OMOP `condition_occurrence` (SNOMED-mapped) or Mayo `FACT_DIAGNOSIS` (ICD, with `PRIMARY_DIAGNOSIS_FLAG` and `ENCOUNTER_NUMBER` → `FACT_ENCOUNTERS.ENCOUNTER_TYPE`); billing diagnoses are in `FACT_CLAIMS_ITEM_DIAGNOSIS` with `FACT_CLAIMS.CLAIM_CLASS_NAME` (inpatient or outpatient).
 
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
 
@@ -84,7 +97,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (63 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
+   Expect every test to pass (64 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -117,12 +130,20 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
        --files <delivered folder> --request $WB/imaging/dicom_request.csv --out $WB/imaging/echo_manifest.csv
    ```
 
-   **ECGs:** if the 12-lead ECGs are inventoried as DICOM, add `ECG` to `dicom_inventory.modalities` and build their manifest the same way with `--modality ECG`. If they are stored as encoded strings in a table, fill `ecg_table:` instead and convert them once to files plus a manifest:
+   **ECGs:** they are encoded strings in `FACT_ECG_WAVEFORM` (MCP, 21 Oct 2026), and `ecg_table:` and `dim_patient:` are already set for it (`format: mayo_waveform`). Add the schema prefixes, then convert them once to files plus a manifest:
 
    ```bash
    python -m mcp_adapter.imaging_sources ecg --config config/study.yaml --out $WB/imaging/ecg
    ```
-3. **ECG source.** Set `ecg_source.manifest` to the ECG manifest from item 2 and `ecg_source.path` to `null` (its paths are complete). Set `kind` to `muse_xml_dir` for GE MUSE XML files or `dicom_ecg` for DICOM waveforms; files converted from a table are recognised whatever the `kind`. A manifest can also be a platform table, written `sql:<schema.table>`; it needs columns `person_id`, `record_date` and `path`.
+
+   The conversion handles the details MCP gave:
+   - it keeps only Rhythm records and decodes each one separately;
+   - it derives the four missing leads;
+   - it reads the sampling rate from the measurement table, or infers it from the record length (2,500 or 5,000 samples);
+   - it counts an ECG once even when it appears under two `PATIENT_DK`s.
+
+   If a lead has several records and none is the full 10 s, the ECG is skipped and counted in report `00_ecg_extraction`. If that count is large, ask MCP how those records relate before relying on it.
+3. **ECG source.** Set `ecg_source.manifest` to the ECG manifest from item 2 and `ecg_source.path` to `null` (its paths are complete). `kind` is already `npy_dir`, which reads the files converted from `FACT_ECG_WAVEFORM`; the code resamples 250 Hz ECGs to 500 Hz. A manifest can also be a platform table, written `sql:<schema.table>`; it needs columns `person_id`, `record_date` and `path`.
 4. **Echo source.** Set `echo_source.manifest` to `$WB/imaging/echo_manifest.csv`, `echo_source.path` to `null` and `kind` to `dicom_dir`. The manifest needs `person_id`, `record_date` and `path`; the `view` column (and optional `ed_frame`, `es_frame`) is added in Step 2b.
 5. **Clinical sign-off.** The clinical reviewer checks every code list in `mcp_adapter/concepts.py` and records approval in the run checklist.
 6. **Check the wiring** in a notebook (the MCP notebook provides the Spark session as `spark`):
@@ -517,7 +538,7 @@ Tick each item as it is done; write the run folder names and decisions next to t
 - [ ] Automatic tier 1 chosen (`audit.auto_tier1`: off, or triage first); if used, the `auto` row of each 09d report passes its spot-check
 - [ ] Outside annotators hired; up to 5 seats issued with `cardioailive.com` accounts; each annotator's DUA form submitted
 - [ ] `ml/` code reviewed and whitelisted by MCP
-- [ ] Radiology training done: request process known; clinic-number mapping confirmed; `FACT_ECHO_TEST` date and patient columns set; ECG storage format known
+- [ ] Radiology training done: request process known; clinic-number mapping confirmed; `FACT_ECHO_TEST` date column set; ECG storage known (done 21 Oct: `FACT_ECG_WAVEFORM`)
 - [ ] De-identification submission CSV (`STUDY_INSTANCE_UID`, `PATIENT_DK`, `MODALITY`, `STMO_NAME_IN_ADL`) given to the TSM; report 00 checked
 - [ ] De-identified files delivered; echo (and ECG) manifests built
 - [ ] Report table columns filled under `reports:` in `config/study.yaml`

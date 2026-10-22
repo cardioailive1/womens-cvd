@@ -13,6 +13,8 @@ TODO left, naming the missing setting.
 """
 from __future__ import annotations
 
+import re
+
 import logging
 from pathlib import Path
 
@@ -141,10 +143,17 @@ def extract_ecg_table(be: Backend, cfg: StudyConfig, out_dir: str | Path, person
     """Convert ECGs stored as encoded strings into .npz files (raw mV + sampling rate) and write
     `manifest.csv` (person_id, record_date, path). Point ecg_source.manifest at that file.
 
-    format: muse_xml   — one row per ECG, the column holds MUSE XML text or base64 of it
-    format: lead_base64 — one row per lead, base64 int16 samples (MUSE WaveFormData style)
+    format: muse_xml      — one row per ECG, the column holds MUSE XML text or base64 of it
+    format: lead_base64   — one row per lead, base64 int16 samples (MUSE WaveFormData style)
+    format: mayo_waveform — Mayo FACT_ECG_WAVEFORM (MCP, 21 Oct 2026): rows keyed by PATIENT_DK +
+                            ACQUISITION_TS, one URL-encoded Base64 int16 record per lead, only
+                            WAVEFORM_TYPE = Rhythm, leads I, II, V1-V6; women are found through
+                            DIM_PATIENT (PATIENT_DK -> PATIENT_CLINIC_NUMBER) and person_map;
+                            sampling rate from FACT_ECG_WAVEFORM_RESTING_MEASUREMENT.ECGSAMPLEBASE
     """
     src = cfg.ecg_table
+    if src.get("format") == "mayo_waveform":
+        return _extract_mayo_waveform(be, cfg, out_dir, person_ids, batch_people)
     _require("ecg_table", src, ("table", "person_column", "date_column", "id_column", "waveform_column"))
     fmt = src.get("format", "muse_xml")
     if fmt == "lead_base64":
@@ -158,7 +167,8 @@ def extract_ecg_table(be: Backend, cfg: StudyConfig, out_dir: str | Path, person
         chunk = pd.DataFrame({"person_id": person_ids[s:s + batch_people]})
         be.register(chunk, "hcman_ecg_people")
         lead = f", t.{src['lead_column']} AS lead" if fmt == "lead_base64" else ""
-        fs_col = f", t.{src['sample_rate_column']} AS fs" if src.get("sample_rate_column") else ""
+        fs_col = (f", t.{src['sample_rate_column']} AS fs"            # a rate column in the same table
+                  if src.get("sample_rate_column") and not src.get("sample_rate_table") else "")
         df = be.sql(f"""
 SELECT t.{src['id_column']} AS ecg_id, t.{src['person_column']} AS person_id,
        CAST(t.{src['date_column']} AS DATE) AS record_date, t.{src['waveform_column']} AS payload{lead}{fs_col}
@@ -183,6 +193,64 @@ FROM {src['table']} t JOIN hcman_ecg_people p ON p.person_id = t.{src['person_co
                                         {"item": "ECGs unreadable", "n": failed}]), ["n"], cfg.min_cell_size),
                  "00_ecg_extraction", cfg.report_dir)
     log.info("extracted %d ECGs (%d unreadable) -> %s", len(man), failed, out / "manifest.csv")
+    return man
+
+
+def _extract_mayo_waveform(be: Backend, cfg: StudyConfig, out_dir, person_ids, batch_people) -> pd.DataFrame:
+    from .features.waveforms import AmbiguousECG, leads_from_records
+    src, dim = cfg.ecg_table, cfg.dim_patient
+    _require("ecg_table", src, ("table", "person_column", "date_column", "waveform_column", "lead_column",
+                                "type_column", "rhythm_value"))
+    _require("dim_patient", dim, ("table", "dk_column", "clinic_number_column"))
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    if person_ids is None:
+        person_ids = Q.cardiac_eval_events(be, cfg).person_id.unique()
+    person_ids = list(pd.unique(pd.Series(person_ids)))
+    w, dk, ts = src["table"], src["person_column"], src["date_column"]
+    fs_join, fs_col = "", ""
+    if src.get("sample_rate_table") and src.get("sample_rate_column"):
+        keys = src.get("sample_rate_keys") or [dk, ts]
+        on = " AND ".join(f"m.{k} = w.{k}" for k in keys)
+        fs_join = (f"LEFT JOIN (SELECT {', '.join(keys)}, MAX({src['sample_rate_column']}) AS fs "
+                   f"FROM {src['sample_rate_table']} GROUP BY {', '.join(keys)}) m ON {on}")
+        fs_col = ", m.fs AS fs"
+    rows, failed, ambiguous, seen = [], 0, 0, set()
+    for s0 in range(0, len(person_ids), batch_people):
+        be.register(pd.DataFrame({"person_id": person_ids[s0:s0 + batch_people]}), "hcman_ecg_people")
+        df = be.sql(f"""
+SELECT w.{dk} AS dk, CAST(w.{ts} AS STRING) AS acq, p.person_id, CAST(w.{ts} AS DATE) AS record_date,
+       w.{src['lead_column']} AS lead, w.{src['waveform_column']} AS payload{fs_col}
+FROM {w} w
+JOIN {dim['table']} d ON d.{dim['dk_column']} = w.{dk}
+{person_join(cfg, 'p', f"d.{dim['clinic_number_column']}")}
+JOIN hcman_ecg_people b ON b.person_id = p.person_id
+{fs_join}
+WHERE w.{src['type_column']} = '{src['rhythm_value']}'""")
+        for (pid, acq), g in df.groupby(["person_id", "acq"]):      # one acquisition per woman and time
+            if (pid, acq) in seen:
+                continue                                             # same ECG under a second PATIENT_DK
+            seen.add((pid, acq))
+            g = g.drop_duplicates(["lead", "payload"])
+            fs = g.fs.dropna().iloc[0] if "fs" in g and g.fs.notna().any() else None
+            try:
+                x, fs = leads_from_records(g.lead, g.payload, fs, float(src.get("units_per_bit", 4.88)),
+                                           bool(src.get("url_encoded", True)))
+            except AmbiguousECG as e:
+                ambiguous += 1; log.debug("ECG %s %s ambiguous: %s", pid, acq, e); continue
+            except Exception as e:                                   # skip, count, keep going
+                failed += 1; log.debug("ECG %s %s skipped: %s", pid, acq, e); continue
+            name = re.sub(r"[^0-9A-Za-z]+", "", f"{pid}_{acq}")
+            path = out / f"{name}.npz"
+            np.savez_compressed(path, x=x.astype(np.float32), fs=fs)
+            rows.append({"person_id": pid, "record_date": g.record_date.iloc[0], "path": str(path), "fs": fs})
+    man = pd.DataFrame(rows, columns=["person_id", "record_date", "path", "fs"])
+    man.to_csv(out / "manifest.csv", index=False)
+    write_report(suppress(pd.DataFrame([{"item": "ECGs extracted", "n": len(man)},
+                                        {"item": "ECGs unreadable", "n": failed},
+                                        {"item": "ECGs skipped: several records per lead, none the full 10 s", "n": ambiguous},
+                                        {"item": "ECGs at 250 Hz (resampled to 500)", "n": int((man.fs == 250).sum())}]),
+                          ["n"], cfg.min_cell_size), "00_ecg_extraction", cfg.report_dir)
+    log.info("extracted %d ECGs (%d unreadable, %d ambiguous) -> %s", len(man), failed, ambiguous, out / "manifest.csv")
     return man
 
 
