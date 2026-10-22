@@ -125,3 +125,23 @@ def build_labels(ev: pd.DataFrame, cohort: pd.DataFrame, cfg: StudyConfig) -> pd
     outc = outcome_labels(ev, cohort, cfg)
     fmd = fmd_trigger_labels(cond, ev, cfg)
     return pd.concat([cond, outc, fmd], axis=1).reset_index().rename(columns={"index": "person_id"})
+
+
+def require_primary(ev: pd.DataFrame, primary: pd.DataFrame, groups=("out_mi", "out_stroke"),
+                    match_days: int = 1) -> tuple[pd.DataFrame, int]:
+    """Optional MACE rule (outcomes.mace_primary_diagnosis): keep an MI or stroke code only when
+    the same woman has that diagnosis flagged PRIMARY within `match_days` of it (Mayo
+    FACT_DIAGNOSIS). Drops history-of and rule-out codes recorded as secondary diagnoses, at the
+    cost of missing real events coded only as secondary. Other groups are untouched.
+    -> (filtered events, number of MI / stroke events dropped)."""
+    is_g = ev.grp.isin(groups)
+    target = ev[is_g].copy()
+    if target.empty:
+        return ev, 0
+    target["_d"] = pd.to_datetime(target.event_date)
+    p = primary.copy(); p["_pd"] = pd.to_datetime(p.event_date)
+    m = target.reset_index().merge(p[["person_id", "grp", "_pd"]], on=["person_id", "grp"], how="left")
+    m["_ok"] = (m._d - m._pd).abs().dt.days <= match_days
+    ok_idx = set(m.loc[m._ok.fillna(False), "index"])
+    keep = ~is_g | ev.index.isin(ok_idx)
+    return ev[keep], int((~keep).sum())

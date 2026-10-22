@@ -234,3 +234,35 @@ JOIN {voc}.concept i ON i.concept_id = ca.ancestor_concept_id
      AND i.vocabulary_id = 'RxNorm' AND i.concept_class_id = 'Ingredient' AND ({names})
 WHERE {days_between(cfg.dialect, 'de.drug_exposure_start_date', 'ch.index_date')} <= 0
 """)
+
+
+# ------------------------------------------------------------------ optional: primary-diagnosis check
+PRIMARY_GROUP_CODES = {"out_mi": ["I21", "I22"], "out_stroke": ["I60", "I61", "I63"]}
+
+
+def primary_diagnoses(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
+    """Cohort women's MI / stroke diagnoses flagged primary in Mayo FACT_DIAGNOSIS (MCP, 21 Oct
+    2026: PRIMARY_DIAGNOSIS_FLAG). -> person_id, event_date, grp. Used only when
+    outcomes.mace_primary_diagnosis.mode is fact_diagnosis."""
+    from .imaging_sources import _require, person_join
+    m = cfg.mace_primary
+    _require("mace_primary_diagnosis", m, ("table", "patient_column", "date_column", "code_column", "flag_column"))
+    groups = [g for g in m.get("applies_to", list(PRIMARY_GROUP_CODES)) if g in PRIMARY_GROUP_CODES]
+    case = " ".join(f"WHEN " + " OR ".join(f"REPLACE(f.{m['code_column']}, '.', '') LIKE '{c}%'" for c in PRIMARY_GROUP_CODES[g])
+                    + f" THEN '{g}'" for g in groups)
+    if m.get("patient_key", "patient_dk") == "patient_dk":
+        dim = cfg.dim_patient
+        _require("dim_patient", dim, ("table", "dk_column", "clinic_number_column"))
+        pj = (f"JOIN {dim['table']} d ON d.{dim['dk_column']} = f.{m['patient_column']} "
+              + person_join(cfg, "p", f"d.{dim['clinic_number_column']}"))
+    else:
+        pj = person_join(cfg, "p", f"f.{m['patient_column']}")
+    flag = str(m.get("flag_value", "Y")).replace("'", "")
+    return be.sql(f"""
+SELECT DISTINCT p.person_id, CAST(f.{m['date_column']} AS DATE) AS event_date,
+       CASE {case} END AS grp
+FROM {m['table']} f
+{pj}
+JOIN {COHORT_VIEW} ch ON ch.person_id = p.person_id
+WHERE UPPER(CAST(f.{m['flag_column']} AS STRING)) = '{flag.upper()}'
+  AND CASE {case} END IS NOT NULL""")
