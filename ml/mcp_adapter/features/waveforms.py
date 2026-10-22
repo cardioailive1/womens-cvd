@@ -80,16 +80,75 @@ def parse_muse_xml(root_or_text) -> tuple[np.ndarray, int]:
     raise ValueError("no Rhythm waveform in the MUSE XML")
 
 
+def _assemble(leads: dict[str, np.ndarray]) -> np.ndarray:
+    """Stored leads (at least I and II) -> (12, n), deriving III, aVR, aVL, aVF from I and II."""
+    if "I" not in leads or "II" not in leads:
+        raise ValueError("leads I and II are needed to derive the limb leads")
+    I, II = leads["I"], leads["II"]
+    leads.setdefault("III", II - I); leads.setdefault("aVR", -(I + II) / 2)
+    leads.setdefault("aVL", I - II / 2); leads.setdefault("aVF", II - I / 2)
+    missing = [l for l in LEADS if l not in leads]
+    if missing:
+        raise ValueError(f"missing leads {missing}")
+    n = min(len(v) for v in leads.values())
+    return np.stack([leads[l][:n] for l in LEADS])
+
+
 def leads_from_base64(lead_ids, payloads, units_per_bit: float = 4.88) -> np.ndarray:
     """Per-lead base64 int16 strings (MUSE-style WaveFormData) -> (12, n) mV, deriving missing
     limb leads from I and II."""
     leads = {str(l).strip(): np.frombuffer(base64.b64decode(p), dtype="<i2").astype(np.float64)
              * units_per_bit / 1000.0 for l, p in zip(lead_ids, payloads)}
-    I, II = leads["I"], leads["II"]
-    leads.setdefault("III", II - I); leads.setdefault("aVR", -(I + II) / 2)
-    leads.setdefault("aVL", I - II / 2); leads.setdefault("aVF", II - I / 2)
-    n = min(len(v) for v in leads.values())
-    return np.stack([leads[l][:n] for l in LEADS])
+    return _assemble(leads)
+
+
+def decode_waveform(payload: str, url_encoded: bool = True) -> np.ndarray:
+    """One Mayo FACT_ECG_WAVEFORM value -> int16 counts. URL-decode, then Base64-decode; samples
+    are signed 16-bit little-endian (MCP, 21 Oct 2026). Each record decodes on its own."""
+    from urllib.parse import unquote
+    s = unquote(str(payload)).strip() if url_encoded else str(payload).strip()
+    s = s.replace("\n", "").replace("\r", "").replace(" ", "+")   # '+' often arrives as a space
+    s += "=" * (-len(s) % 4)
+    raw = base64.urlsafe_b64decode(s) if ("-" in s or "_" in s) else base64.b64decode(s)
+    if len(raw) % 2:
+        raise ValueError("odd byte count: not 16-bit samples")
+    return np.frombuffer(raw, dtype="<i2")
+
+
+class AmbiguousECG(ValueError):
+    """A lead has several Rhythm records and none (or more than one) is the full 10 s."""
+
+
+def leads_from_records(lead_ids, payloads, fs: int | None = None, units_per_bit: float = 4.88,
+                       url_encoded: bool = True, seconds: int = SECONDS) -> tuple[np.ndarray, int]:
+    """Mayo FACT_ECG_WAVEFORM rows of one acquisition (WAVEFORM_TYPE = Rhythm; leads I, II,
+    V1-V6) -> ((12, n) mV, sampling rate).
+
+    MCP: records are not ordered pieces of one recording, so they are never concatenated. When a
+    lead has more than one record, the one holding exactly `seconds` of signal is used; otherwise
+    the ECG is skipped (AmbiguousECG). Without a sampling rate, it is inferred from the length
+    (2,500 samples = 250 Hz, 5,000 = 500 Hz for 10 s)."""
+    per: dict[str, list[np.ndarray]] = {}
+    for l, p in zip(lead_ids, payloads):
+        per.setdefault(str(l).strip(), []).append(decode_waveform(p, url_encoded))
+    if fs is None or (isinstance(fs, float) and np.isnan(fs)):
+        lens = {len(a) for v in per.values() for a in v}
+        full = [n for n in lens if n in (250 * seconds, 500 * seconds)]
+        if len(full) != 1:
+            raise AmbiguousECG(f"cannot infer the sampling rate from lengths {sorted(lens)}")
+        fs = full[0] // seconds
+    fs = int(fs)
+    leads = {}
+    for l, arrs in per.items():
+        if len(arrs) == 1:
+            a = arrs[0]
+        else:
+            full = [a for a in arrs if len(a) == fs * seconds]
+            if len(full) != 1:
+                raise AmbiguousECG(f"lead {l}: {len(arrs)} records, {len(full)} of full length")
+            a = full[0]
+        leads[l] = a.astype(np.float64) * units_per_bit / 1000.0          # counts -> microvolts -> mV
+    return _assemble(leads), fs
 
 
 def read_dicom_ecg(path: str | Path) -> tuple[np.ndarray, int]:

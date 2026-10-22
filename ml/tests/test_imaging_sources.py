@@ -139,3 +139,49 @@ def test_manifest_from_delivered_files(tmp_path):
     assert sorted(man.person_id) == [11, 12]
     assert man.set_index("person_id").record_date.to_dict() == {11: "2020-01-01", 12: "2020-03-15"}
     assert set(man.columns) >= {"person_id", "record_date", "path"}
+
+
+def test_extract_mayo_fact_ecg_waveform(db, tmp_path):
+    """FACT_ECG_WAVEFORM as MCP described it (21 Oct 2026): URL-encoded Base64 int16 per lead,
+    Rhythm vs Median rows, PATIENT_DK -> DIM_PATIENT -> clinic number, rate from a measurement table."""
+    from urllib.parse import quote
+    from mcp_adapter.features.waveforms import decode_waveform
+    people = db.execute("SELECT person_id, person_source_value FROM omop_cdm.person LIMIT 4").df()
+    enc = lambda v: quote(base64.b64encode(v.astype("<i2").tobytes()).decode(), safe="")
+    sig = lambda n, k: (np.sin(np.arange(n) / (30 + k)) * 400).astype("<i2")
+    rows, dims, meas = [], [], []
+    for k, r in enumerate(people.itertuples()):
+        dk = 7000 + k
+        dims.append((dk, r.person_source_value, "N"))
+        fs = 250 if k == 1 else 500
+        acq = f"2020-03-0{k + 1} 10:15:00"
+        for l in LEADS8:
+            rows.append((dk, acq, l, "Rhythm", enc(sig(fs * 10, k))))
+            rows.append((dk, acq, l, "Median", enc(sig(600, k))))                 # never used
+        if k != 2:
+            meas.append((dk, acq, fs))                                           # k = 2: rate inferred from length
+    dims.append((7100, people.person_source_value[0], "Y"))                     # same woman, second system
+    rows += [(7100, "2020-03-01 10:15:00", l, "Rhythm", enc(sig(5000, 0))) for l in LEADS8]
+    rows += [(7003, "2020-05-05 09:00:00", l, "Rhythm", enc(sig(1200, 3))) for l in LEADS8]  # two partial
+    rows += [(7003, "2020-05-05 09:00:00", l, "Rhythm", enc(sig(1300, 3))) for l in LEADS8]  # records: skip
+    rows.append((7002, "2020-06-06 08:00:00", "I", "Rhythm", "%%%not-base64"))  # unreadable
+    db.register("w_df", pd.DataFrame(rows, columns=["PATIENT_DK", "ACQUISITION_TS", "LEAD_ID", "WAVEFORM_TYPE", "WAVEFORM"]))
+    db.register("d_df", pd.DataFrame(dims, columns=["PATIENT_DK", "PATIENT_CLINIC_NUMBER", "PATIENT_MERGED_FLAG"]))
+    db.register("m_df", pd.DataFrame(meas, columns=["PATIENT_DK", "ACQUISITION_TS", "ECGSAMPLEBASE"]))
+    for t, src in (("fact_ecg_waveform", "w_df"), ("dim_patient", "d_df"), ("fact_ecg_meas", "m_df")):
+        db.execute(f"CREATE OR REPLACE TABLE {t} AS SELECT * FROM {src}")
+    cfg = cfg_for(tmp_path)
+    assert cfg.ecg_table["format"] == "mayo_waveform" and cfg.dim_patient["table"] == "DIM_PATIENT"
+    cfg.ecg_table.update(table="fact_ecg_waveform", sample_rate_table="fact_ecg_meas")
+    cfg.dim_patient.update(table="dim_patient")
+    man = extract_ecg_table(DuckDBBackend(db), cfg, tmp_path / "ecg", person_ids=people.person_id.tolist())
+    assert len(man) == 4                                   # 4 women; the second-system copy is not double-counted
+    assert sorted(man.fs.tolist()) == [250, 500, 500, 500]
+    for p in man.path:
+        x = load_ecg(p, "npy_dir")
+        assert x.shape == (12, N_SAMPLES) and np.isfinite(x).all()
+    raw = np.load(man.path.iloc[0]); assert raw["x"].shape[0] == 12
+    rep = pd.read_csv(tmp_path / "rep" / "00_ecg_extraction.csv").set_index("item")
+    assert "ECGs skipped: several records per lead, none the full 10 s" in rep.index
+    v = np.array([-3, 0, 32767, -32768], dtype="<i2")
+    assert (decode_waveform(enc(v)) == v).all()                                # URL + Base64 round trip

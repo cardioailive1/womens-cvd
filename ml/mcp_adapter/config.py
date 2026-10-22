@@ -25,6 +25,7 @@ class StudyConfig:
     dicom_inventory: dict = field(default_factory=dict)
     person_map: dict = field(default_factory=dict)
     ecg_table: dict = field(default_factory=dict)
+    dim_patient: dict = field(default_factory=dict)
     ecg_source: SourceConfig = field(default_factory=SourceConfig)
     echo_source: SourceConfig = field(default_factory=SourceConfig)
 
@@ -82,6 +83,7 @@ class StudyConfig:
             dicom_inventory=p.get("dicom_inventory") or {},
             person_map=p.get("person_map") or {},
             ecg_table=p.get("ecg_table") or {},
+            dim_patient=p.get("dim_patient") or {},
             ecg_source=SourceConfig(**(p.get("ecg_source") or {})),
             echo_source=SourceConfig(**(p.get("echo_source") or {})),
             study_start=s.get("study_start", "2010-01-01"),
