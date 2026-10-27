@@ -1,8 +1,12 @@
-"""Two-tier audit of the automatic labels (echo annotations and condition labels).
+"""Audit of the automatic labels (echo annotations, condition and outcome labels), in this order:
 
-  Tier 1 — data scientists audit EVERY item in the audit set. They see the automatic label and
+  Automatic audit — REQUIRED, right after automatic labelling (annotate.auto_audit, then
+           `submit_auto`). Every item gets agree / disagree / uncertain from independent evidence.
+           Neither tier opens until every item in the audit set has a verdict.
+  Tier 1 — data scientists. They see the automatic label and the automatic audit's finding and
            answer agree / disagree (with the corrected value) / uncertain. Optionally more than
-           one data scientist per item (`tier1_per_item`).
+           one data scientist per item (`tier1_per_item`). Which items reach them depends on
+           `auto_tier1` (below).
   Tier 2 — a cardiologist adjudicates, blinded to both the automatic and the data-scientist label:
              * every disagreement (data scientist vs automatic label, or between data scientists)
              * every item a data scientist marked uncertain
@@ -10,11 +14,10 @@
                how many wrong labels slip through tier 1 (automation bias included).
            The three kinds are shuffled together so the cardiologist cannot tell which is which.
 
-Optional automatic tier 1 (`auto_tier1`, see annotate.auto_audit): an automatic auditor checks
-each label against independent evidence first.
-  off      — data scientists audit everything (default).
-  triage   — items the auditor agrees with are tier-1 accepted without a data scientist; the
-             ones it disagrees with or is unsure about go to the data scientists, whose answer decides.
+How the automatic verdicts route items (`auto_tier1`):
+  triage   — default. Items the auditor agrees with are tier-1 accepted without a data scientist;
+             the ones it disagrees with or is unsure about go to the data scientists, whose
+             answer decides.
   replace  — the auditor is tier 1; its disagreements and uncertain items go straight to tier 2.
 The spot-check samples auto-accepted and human-accepted items separately
 (`auto_spot_check_fraction` / `spot_check_fraction`, each at least `spot_check_min`), so the
@@ -44,7 +47,7 @@ from .phenotype import task_name, wilson
 from .store import AnnotationStore
 
 VERDICTS = ("agree", "disagree", "uncertain")
-AUTO_MODES = ("off", "triage", "replace")
+AUTO_MODES = ("triage", "replace")             # the automatic audit is required; there is no "off"
 AUTO_AUDITOR, AUTO_SOURCE = "auto-audit", "auto:audit"
 ECHO_TASK = "echo"
 FRAME_TOLERANCE = 2          # ED / ES within this many frames count as the same
@@ -115,7 +118,7 @@ class LabelAudit:
     spot_check_min: int = 20
     tier1_per_item: int = 1
     seed: int = 0
-    auto_tier1: str = "off"                   # off | triage | replace (annotate.auto_audit)
+    auto_tier1: str = "triage"                # triage | replace (the automatic audit is required)
     auto_spot_check_fraction: float = 0.20    # of auto-accepted items
     _key: pd.Index = field(init=False, repr=False)
 
@@ -126,7 +129,7 @@ class LabelAudit:
         if overlap:
             raise ValueError(f"{sorted(overlap)} listed as both data scientist and cardiologist")
         if self.auto_tier1 not in AUTO_MODES:
-            raise ValueError(f"auto_tier1 must be one of {AUTO_MODES}")
+            raise ValueError(f"the automatic audit is required: auto_tier1 must be one of {AUTO_MODES}")
         if AUTO_AUDITOR in set(self.data_scientists) | set(self.cardiologists):
             raise ValueError(f"{AUTO_AUDITOR!r} is reserved for the automatic auditor")
         self.items = self.items.drop_duplicates(["item_id", "task"]).reset_index(drop=True)
@@ -141,7 +144,7 @@ class LabelAudit:
                    spot_check_fraction=float(a.get("spot_check_fraction", 0.10)),
                    spot_check_min=int(a.get("spot_check_min", 20)),
                    tier1_per_item=int(a.get("tier1_per_item", 1)), seed=cfg.seed,
-                   auto_tier1=str(a.get("auto_tier1", "off") or "off"),
+                   auto_tier1=str(a.get("auto_tier1", "triage") or "triage"),
                    auto_spot_check_fraction=float(a.get("auto_spot_check_fraction", 0.20)))
 
     # ---- raw reads
@@ -179,7 +182,7 @@ class LabelAudit:
 
     def _t1_effective(self) -> dict:
         """(item_id, task) -> (rows that make up tier 1, complete?, 'auto' | 'human')."""
-        t1 = self._tier(1, auto=self.auto_tier1 != "off")
+        t1 = self._tier(1, auto=True)
         out = {}
         for key, g in t1.groupby(["item_id", "task"]):
             hum, aut = g[g.annotator != AUTO_AUDITOR], g[g.annotator == AUTO_AUDITOR]
@@ -215,9 +218,24 @@ class LabelAudit:
         t = self._tier(1, auto=True)
         return t[t.annotator == AUTO_AUDITOR][["item_id", "task", "verdict", "corrected", "confidence", "note"]]
 
+    def automatic_audit_missing(self) -> pd.DataFrame:
+        """Items in the audit set that the automatic audit has not given a verdict yet."""
+        av = self.auto_verdicts()
+        done = set(zip(av.item_id, av.task))
+        return self.items[[(i, t) not in done for i, t in zip(self.items.item_id, self.items.task)]]
+
+    def _require_automatic_audit(self) -> None:
+        missing = self.automatic_audit_missing()
+        if len(missing):
+            raise RuntimeError(
+                f"{len(missing)} of {len(self.items)} items have no automatic-audit verdict. The automatic "
+                "audit is required before the data-scientist and cardiologist audits: run "
+                "annotate.auto_audit (audit_phenotypes / audit_echo) and audit.submit_auto(...) first.")
+
     # ---- tier 1
     def tier1_queue(self, annotator: str) -> pd.DataFrame:
         """Items this data scientist has not audited that still need tier-1 reviews."""
+        self._require_automatic_audit()
         t1 = self._tier(1)
         mine = set(zip(t1[t1.annotator == annotator].item_id, t1[t1.annotator == annotator].task))
         eff = self._t1_effective()
@@ -236,6 +254,7 @@ class LabelAudit:
                      value=None, note: str | None = None) -> None:
         if annotator not in self.data_scientists:
             raise PermissionError(f"{annotator} is not a listed data scientist (tier 1)")
+        self._require_automatic_audit()
         if verdict not in VERDICTS:
             raise ValueError(f"verdict must be one of {VERDICTS}")
         auto = self._auto(item_id, task)
@@ -252,6 +271,7 @@ class LabelAudit:
     def tier2_queue(self, annotator: str | None = None) -> pd.DataFrame:
         """Shuffled cardiologist queue: disagreements, uncertain items and the blinded spot-check.
         `reason` is for reporting only; the review screen never shows it."""
+        self._require_automatic_audit()
         t1 = self._tier(1)
         st = self._t1_state()
         rows = [(r.item_id, r.task, r.outcome) for r in st.itertuples() if r.outcome != "accepted"]
@@ -277,6 +297,7 @@ class LabelAudit:
         For echo: echo_value(view, ed, es), view may be UNUSABLE."""
         if annotator not in self.cardiologists:
             raise PermissionError(f"{annotator} is not a listed cardiologist (tier 2)")
+        self._require_automatic_audit()
         t1 = self._tier(1)
         if ((t1.item_id == str(item_id)) & (t1.task == task) & (t1.annotator == annotator)).any():
             raise PermissionError("an item cannot be adjudicated by someone who audited it at tier 1")

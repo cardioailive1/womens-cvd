@@ -124,13 +124,14 @@ audit:
   spot_check_fraction: 0.10        # share of tier-1-accepted items re-labelled blind by the cardiologist
   spot_check_min: 20               # at least this many spot-checks per audit
   spot_check_target: 0.95          # pass when the spot-check agreement's 95% CI lower bound reaches this
-  # Optional automatic tier 1 (annotate.auto_audit): checks each label against independent evidence
-  # (notes, procedures, reported LVEF; a second view model and phase estimate for echo).
-  #   off     - data scientists audit everything
+  # Automatic audit (annotate.auto_audit): REQUIRED, right after automatic labelling and before the
+  # data-scientist and cardiologist audits; neither tier opens until every item has a verdict. It
+  # checks each label against independent evidence (notes, procedures, reported LVEF; a second view
+  # model and phase estimate for echo). How its verdicts route items:
   #   triage  - auto-agreed items count as tier-1 accepted; flagged items go to the data scientists
-  #   replace - the automatic auditor is tier 1; flagged items go straight to the cardiologist
+  #   replace - the automatic audit is tier 1; flagged items go straight to the cardiologist
   # Start with triage; use replace only after the auto row of report 09d passes its spot-check.
-  auto_tier1: "off"
+  auto_tier1: "triage"
   auto_spot_check_fraction: 0.20   # share of auto-accepted items re-labelled blind (at least spot_check_min)
 
 training:

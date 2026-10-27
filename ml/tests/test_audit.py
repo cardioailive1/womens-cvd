@@ -17,6 +17,13 @@ from annotate.store import AnnotationStore
 DS, CARD = ["ds_ana", "ds_ben"], ["dr_cole"]
 
 
+def run_automatic_audit(audit, verdict="uncertain"):
+    """The required automatic audit, stubbed: every item gets the same verdict. 'uncertain' sends
+    every item to the data scientists, which is what these tier tests exercise."""
+    audit.submit_auto(pd.DataFrame({"item_id": audit.items.item_id, "task": audit.items.task,
+                                    "verdict": verdict, "value": None, "confidence": 0.5, "note": "stub"}))
+
+
 def empty_ctx():
     cols = {"diagnoses": ["person_id", "rel_day", "code", "name"],
             "procedures": ["person_id", "rel_day", "code", "name"],
@@ -37,6 +44,7 @@ def pheno(tmp_path):
     sample["truth"] = truth
     audit = LabelAudit(phenotype_audit_items(sample), AnnotationStore(tmp_path / "audit.csv"), DS, CARD,
                        spot_check_fraction=0.10, spot_check_min=10, seed=3)
+    run_automatic_audit(audit)
     return audit, sample, set(wrong.tolist())
 
 
@@ -152,6 +160,7 @@ def test_echo_audit_end_to_end(tmp_path):
     assert len(items) == 12 and (items.task == ECHO_TASK).all()
 
     audit = LabelAudit(items, AnnotationStore(tmp_path / "audit.csv"), DS, CARD, spot_check_min=2, seed=0)
+    run_automatic_audit(audit)
     scr = AuditScreen(audit, "ds_ana", tier=1, echo_cache=tmp_path / "cache")
     first = scr.current()
     assert json.loads(first["auto_value"])["view"] in E.VIEWS and first["frames"].ndim == 3
@@ -189,3 +198,24 @@ def test_from_config(tmp_path):
     cfg.audit.update(data_scientists=["ds_ana"], cardiologists=["dr_cole"], tier1_per_item=2)
     a = LabelAudit.from_config(items, AnnotationStore(tmp_path / "a.csv"), cfg)
     assert a.tier1_per_item == 2 and a.spot_check_min == 20
+
+
+def test_automatic_audit_is_required(tmp_path):
+    items = pd.DataFrame({"item_id": ["1", "2"], "task": ["phenotype:SCAD"] * 2, "auto_value": ["yes", "no"]})
+    with pytest.raises(ValueError, match="required"):
+        LabelAudit(items, AnnotationStore(tmp_path / "x.csv"), DS, CARD, auto_tier1="off")
+    audit = LabelAudit(items, AnnotationStore(tmp_path / "a.csv"), DS, CARD)
+    assert audit.auto_tier1 == "triage"
+    for call in (lambda: audit.tier1_queue("ds_ana"), lambda: audit.tier2_queue(),
+                 lambda: audit.submit_tier1("1", "phenotype:SCAD", "agree", "ds_ana"),
+                 lambda: audit.submit_tier2("1", "phenotype:SCAD", "yes", "dr_cole")):
+        with pytest.raises(RuntimeError, match="automatic-audit verdict"):
+            call()
+    audit.submit_auto(pd.DataFrame({"item_id": ["1"], "task": ["phenotype:SCAD"], "verdict": ["agree"],
+                                    "value": [None], "confidence": [0.9], "note": ["notes affirm"]}))
+    assert len(audit.automatic_audit_missing()) == 1
+    with pytest.raises(RuntimeError, match="1 of 2"):
+        audit.tier1_queue("ds_ana")                                     # every item needs a verdict
+    run_automatic_audit(audit, "uncertain")
+    assert audit.automatic_audit_missing().empty
+    assert len(audit.tier1_queue("ds_ana")) == 2                         # now the tiers open
