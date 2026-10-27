@@ -18,10 +18,11 @@ disagrees only when the evidence clearly points the other way (and then gives th
 value), and says uncertain whenever the evidence is missing or mixed, so it never confirms a
 label it found nothing for.
 
-How the verdicts are used is set by `audit.auto_tier1` in config/study.yaml (annotate.audit):
-  off      — not used (default).
-  triage   — items the auditor agrees with count as tier-1 accepted; every item it disagrees
-             with or is unsure about goes to a data scientist, whose answer then decides.
+The automatic audit is REQUIRED: it runs right after automatic labelling and before the
+data-scientist and cardiologist audits, and LabelAudit opens neither tier until every item has a
+verdict. How the verdicts route items is set by `audit.auto_tier1` in config/study.yaml:
+  triage   — default. Items the auditor agrees with count as tier-1 accepted; every item it
+             disagrees with or is unsure about goes to a data scientist, whose answer then decides.
   replace  — the auditor is the whole of tier 1; its disagreements and uncertain items go
              straight to the cardiologist.
 Either way the cardiologist's blinded spot-check samples the auto-accepted items separately

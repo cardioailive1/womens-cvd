@@ -23,7 +23,7 @@ mcp_adapter/             OMOP CDM v5.4 -> HCMAN inputs (runs inside the MCP work
 hcman/                   PyTorch model, pre-training, training, evaluation, export, serving
 annotate/                echo view + ED/ES auto-annotation, Jupyter review tool, chart review of labels,
                          two-tier label audit (audit.py, audit_ui.py),
-                         optional automatic tier-1 auditor (auto_audit.py), reviewer training and
+                         required automatic audit before both tiers (auto_audit.py), reviewer training and
                          qualification on a synthetic kit, run on a laptop
                          (synthetic_cases.py, training.py; notebooks/reviewer_training.ipynb)
 tests/                   synthetic OMOP database + end-to-end tests

@@ -140,7 +140,8 @@ def test_replace_mode_skips_data_scientists(tmp_path):
     items = phenotype_audit_items(sample)
     audit = LabelAudit(items, AnnotationStore(tmp_path / "a.csv"), DS, CARD, spot_check_min=5,
                        auto_tier1="replace", seed=0)
-    assert audit.tier1_queue("ds_ana").shape[0] == len(items)            # nothing run yet: people would audit
+    with pytest.raises(RuntimeError):                                    # nothing run yet: tiers stay closed
+        audit.tier1_queue("ds_ana")
     av = audit_phenotypes(items, ctx)
     audit.submit_auto(av)
     assert audit.tier1_queue("ds_ana").empty
@@ -162,13 +163,15 @@ def test_mode_and_reserved_name(tmp_path):
     with pytest.raises(ValueError):
         LabelAudit(items, AnnotationStore(tmp_path / "a.csv"), DS, CARD, auto_tier1="always")
     with pytest.raises(ValueError):
+        LabelAudit(items, AnnotationStore(tmp_path / "a.csv"), DS, CARD, auto_tier1="off")
+    with pytest.raises(ValueError):
         LabelAudit(items, AnnotationStore(tmp_path / "a.csv"), [AUTO_AUDITOR], CARD)
     from pathlib import Path
     from mcp_adapter.config import StudyConfig
     cfg = StudyConfig.load(Path(__file__).resolve().parents[1] / "config/study.yaml")
     cfg.audit.update(data_scientists=["ds_ana"], cardiologists=["dr_cole"])
     a = LabelAudit.from_config(items, AnnotationStore(tmp_path / "a.csv"), cfg)
-    assert a.auto_tier1 == "off" and a.auto_spot_check_fraction == 0.20
+    assert a.auto_tier1 == "triage" and a.auto_spot_check_fraction == 0.20
     cfg.audit["auto_tier1"] = "triage"
     assert LabelAudit.from_config(items, AnnotationStore(tmp_path / "b.csv"), cfg).auto_tier1 == "triage"
 
@@ -241,6 +244,8 @@ def test_outcome_labels_are_reviewable(tmp_path):
     lab2.loc[lab2.person_id == hidden, "y_atypical"] = 0.0
     audit.items = pd.concat([audit.items, pd.DataFrame({"item_id": [str(hidden)], "task": ["phenotype:atypical"],
                                                          "auto_value": ["no"]})], ignore_index=True)
+    audit.submit_auto(pd.DataFrame({"item_id": audit.items.item_id, "task": audit.items.task, "verdict": "uncertain",
+                                    "value": None, "confidence": 0.5, "note": "stub"}))   # required first
     audit.submit_tier1(str(hidden), "phenotype:atypical", "uncertain", "ds_ana")
     audit.submit_tier2(str(hidden), "phenotype:atypical", "yes", "dr_cole")
     new, changed = apply_to_labels(audit, lab2)

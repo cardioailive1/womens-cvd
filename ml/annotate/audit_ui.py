@@ -6,7 +6,7 @@ correction) or Uncertain:
     from annotate.audit_ui import AuditScreen
     AuditScreen(audit, annotator="ds_jane", tier=1, phenotype_context=ctx, echo_cache=cache).show()
 
-With the automatic tier 1 on (audit.auto_tier1), the tier-1 screen also shows the automatic
+The automatic audit runs first (required); the tier-1 screen also shows the automatic
 auditor's finding (verdict and why) for the items it flagged; the data scientist's answer decides.
 
 Tier 2, cardiologist — the same screen with tier=2. No automatic or data-scientist label is shown,
@@ -52,7 +52,7 @@ class AuditScreen:
         self.pos = 0
         self._clip = None
         self._auto_audit = {}
-        if self.tier == 1 and self.audit.auto_tier1 != "off":
+        if self.tier == 1:
             av = self.audit.auto_verdicts()
             self._auto_audit = {(r.item_id, r.task): {"verdict": r.verdict, "note": r.note}
                                 for r in av.itertuples()}
