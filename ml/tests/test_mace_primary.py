@@ -27,7 +27,7 @@ def test_require_primary_unit():
 def test_primary_rule_in_the_pipeline(tmp_path):
     con = duckdb.connect(); load_into_duckdb(con)
     be = DuckDBBackend(con)
-    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", report_dir=str(tmp_path / "rep"),
+    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", cdm_schema="omop_cdm", vocab_schema="omop_cdm", report_dir=str(tmp_path / "rep"),
                            imaging_required=False)
     assert cfg.mace_primary["mode"] == "off"
     base = build_study(be, cfg, tmp_path / "off")["labels"]
@@ -43,7 +43,8 @@ WHERE c.concept_code LIKE 'I21%' OR c.concept_code LIKE 'I22%' OR c.concept_code
     dims = con.execute("SELECT person_id + 500000 AS PATIENT_DK, person_source_value AS PATIENT_CLINIC_NUMBER FROM omop_cdm.person").df()
     con.register("fd", fd); con.register("dims", dims)
     con.execute("CREATE TABLE fact_diagnosis AS SELECT * FROM fd; CREATE TABLE dim_patient AS SELECT * FROM dims")
-    cfg.mace_primary.update(mode="fact_diagnosis", table="fact_diagnosis")
+    cfg.mace_primary.update(mode="fact_diagnosis", table="fact_diagnosis", patient_key="patient_dk",
+                            patient_column="PATIENT_DK", code_dim_table=None)
     cfg.dim_patient.update(table="dim_patient")
     on = build_study(be, cfg, tmp_path / "on")["labels"]
     merged = base.merge(on, on="person_id", suffixes=("_off", "_on"))
@@ -52,3 +53,31 @@ WHERE c.concept_code LIKE 'I21%' OR c.concept_code LIKE 'I22%' OR c.concept_code
     assert len(lost) and (lost.person_id % 2 == 1).all()                # only women without a primary flag
     rep = pd.read_csv(tmp_path / "rep" / "04b_mace_primary_diagnosis.csv")
     assert rep["item"].iloc[0].startswith("MI / stroke codes dropped")
+
+
+def test_primary_rule_from_omop_condition_status(tmp_path):
+    """omop mode: OMOP condition_status_concept_id 32902 (MCP's ETL copies PRIMARY_DIAGNOSIS_FLAG)."""
+    con = duckdb.connect(); load_into_duckdb(con)
+    be = DuckDBBackend(con)
+    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", cdm_schema="omop_cdm", vocab_schema="omop_cdm",
+                           report_dir=str(tmp_path / "rep"), imaging_required=False)
+    base = build_study(be, cfg, tmp_path / "off")["labels"]
+    con.execute("ALTER TABLE omop_cdm.condition_occurrence ADD COLUMN condition_status_concept_id INTEGER")
+    con.execute("UPDATE omop_cdm.condition_occurrence SET condition_status_concept_id = "
+                "CASE WHEN person_id % 2 = 0 THEN 32902 ELSE 32908 END")
+    cfg.mace_primary.update(mode="omop")
+    on = build_study(be, cfg, tmp_path / "on")["labels"]
+    merged = base.merge(on, on="person_id", suffixes=("_off", "_on"))
+    assert (merged.y_mace_on <= merged.y_mace_off).all()
+    lost = merged[(merged.y_mace_off == 1) & (merged.y_mace_on == 0)]
+    assert len(lost) and (lost.person_id % 2 == 1).all()
+
+
+def test_unknown_primary_mode_fails(tmp_path):
+    import pytest
+    con = duckdb.connect(); load_into_duckdb(con)
+    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", cdm_schema="omop_cdm", vocab_schema="omop_cdm",
+                           report_dir=str(tmp_path / "rep"), imaging_required=False)
+    cfg.mace_primary.update(mode="primary")
+    with pytest.raises(ValueError, match="mace_primary_diagnosis.mode"):
+        build_study(DuckDBBackend(con), cfg, tmp_path / "x")

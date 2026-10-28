@@ -187,8 +187,10 @@ def cohort_code_events(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
 def cohort_measurements(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
     cdm, voc = cfg.cdm_schema, cfg.vocab_schema
     lo = -cfg.lookback_days
+    # DISTINCT: MCP's OMOP ETL writes each lab result twice (rule 1 LOINC, rule 2 the Mayo lab
+    # description) and both rows can map to the same standard concept (OMOP guide, Notes and Gaps).
     return be.sql(f"""
-SELECT m.person_id, ch.index_date, l.item, CAST(m.measurement_date AS DATE) AS event_date,
+SELECT DISTINCT m.person_id, ch.index_date, l.item, CAST(m.measurement_date AS DATE) AS event_date,
        m.value_as_number, COALESCE(u.concept_code, m.unit_source_value) AS unit
 FROM {cdm}.measurement m
 JOIN {COHORT_VIEW} ch ON ch.person_id = m.person_id
@@ -240,16 +242,35 @@ WHERE {days_between(cfg.dialect, 'de.drug_exposure_start_date', 'ch.index_date')
 PRIMARY_GROUP_CODES = {"out_mi": ["I21", "I22"], "out_stroke": ["I60", "I61", "I63"]}
 
 
+PRIMARY_DIAGNOSIS_STATUS = 32902   # OMOP condition_status "Primary diagnosis" (MCP ETL: PRIMARY_DIAGNOSIS_FLAG = Y)
+
+
 def primary_diagnoses(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
-    """Cohort women's MI / stroke diagnoses flagged primary in Mayo FACT_DIAGNOSIS (MCP, 21 Oct
-    2026: PRIMARY_DIAGNOSIS_FLAG). -> person_id, event_date, grp. Used only when
-    outcomes.mace_primary_diagnosis.mode is fact_diagnosis."""
+    """Cohort women's MI / stroke diagnoses flagged primary. -> person_id, event_date, grp.
+    Used only when outcomes.mace_primary_diagnosis.mode is not off:
+      omop           - OMOP condition_occurrence.condition_status_concept_id = 32902; MCP's ETL
+                       sets it from FACT_DIAGNOSIS.PRIMARY_DIAGNOSIS_FLAG (OMOP guide, 28 Oct 2026)
+      fact_diagnosis - Mayo FACT_DIAGNOSIS directly (MCP, 21 Oct 2026)"""
     from .imaging_sources import _require, person_join
     m = cfg.mace_primary
+    if m.get("mode") == "omop":
+        groups = [g for g in m.get("applies_to", list(PRIMARY_GROUP_CODES)) if g in PRIMARY_GROUP_CODES]
+        case = " ".join("WHEN " + " OR ".join(f"REPLACE(c.concept_code, '.', '') LIKE '{x}%'" for x in PRIMARY_GROUP_CODES[g])
+                        + f" THEN '{g}'" for g in groups)
+        return be.sql(f"""
+SELECT DISTINCT co.person_id, CAST(co.condition_start_date AS DATE) AS event_date, CASE {case} END AS grp
+FROM {cfg.cdm_schema}.condition_occurrence co
+JOIN {COHORT_VIEW} ch ON ch.person_id = co.person_id
+JOIN {cfg.vocab_schema}.concept c ON c.concept_id = co.condition_source_concept_id
+WHERE co.condition_status_concept_id = {int(m.get("status_concept_id", PRIMARY_DIAGNOSIS_STATUS))}
+  AND c.vocabulary_id IN ('ICD10CM', 'ICD10') AND CASE {case} END IS NOT NULL""")
     _require("mace_primary_diagnosis", m, ("table", "patient_column", "date_column", "code_column", "flag_column"))
     groups = [g for g in m.get("applies_to", list(PRIMARY_GROUP_CODES)) if g in PRIMARY_GROUP_CODES]
-    case = " ".join(f"WHEN " + " OR ".join(f"REPLACE(f.{m['code_column']}, '.', '') LIKE '{c}%'" for c in PRIMARY_GROUP_CODES[g])
+    code = "dc" if m.get("code_dim_table") else "f"      # code in DIM_DIAGNOSIS_CODE via DIAGNOSIS_CODE_DK
+    case = " ".join(f"WHEN " + " OR ".join(f"REPLACE({code}.{m['code_column']}, '.', '') LIKE '{c}%'" for c in PRIMARY_GROUP_CODES[g])
                     + f" THEN '{g}'" for g in groups)
+    code_join = (f"JOIN {m['code_dim_table']} dc ON dc.{m['code_dk_column']} = f.{m['code_dk_column']}"
+                 if m.get("code_dim_table") else "")
     if m.get("patient_key", "patient_dk") == "patient_dk":
         dim = cfg.dim_patient
         _require("dim_patient", dim, ("table", "dk_column", "clinic_number_column"))
@@ -262,6 +283,7 @@ def primary_diagnoses(be: Backend, cfg: StudyConfig) -> pd.DataFrame:
 SELECT DISTINCT p.person_id, CAST(f.{m['date_column']} AS DATE) AS event_date,
        CASE {case} END AS grp
 FROM {m['table']} f
+{code_join}
 {pj}
 JOIN {COHORT_VIEW} ch ON ch.person_id = p.person_id
 WHERE UPPER(CAST(f.{m['flag_column']} AS STRING)) = '{flag.upper()}'

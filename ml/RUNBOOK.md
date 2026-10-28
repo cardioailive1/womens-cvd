@@ -74,6 +74,19 @@ Everyone who audits needs a workspace account and DUA, and is listed by user nam
 - **Mortality:** `FACT_MORTALITY_STATUS` combines the Mayo record with third-party mortality data. Its last live interaction is a completed appointment, an immunization, a lab collection or a surgical case.
 - **Diagnoses:** they are in OMOP `condition_occurrence` (SNOMED-mapped) or Mayo `FACT_DIAGNOSIS` (ICD, with `PRIMARY_DIAGNOSIS_FLAG` and `ENCOUNTER_NUMBER` → `FACT_ENCOUNTERS.ENCOUNTER_TYPE`); billing diagnoses are in `FACT_CLAIMS_ITEM_DIAGNOSIS` with `FACT_CLAIMS.CLAIM_CLASS_NAME` (inpatient or outpatient).
 
+**What MCP confirmed (28 Oct 2026),** from Adam Resnick's reply and the *OMOP CDM ETL Mapping Pipeline Guide* he attached (also in the Resource Hub):
+- **Warehouse:** BigQuery. Mayo-native `FACT_*` / `DIM_*` tables are in dataset `mcp`, and OMOP CDM v5.4 with its vocabulary is in `OMOP_v6_1`. The config now uses `dialect: bigquery` and these names; confirm them, and any project prefix, in the data-environment session (`My_First_Query.ipynb`).
+- **Work dataset:** the project can write saved tables to a work dataset (`results_schema: cardioai_work`). The pipeline writes its helper tables there, and that is where the validation and test split is locked.
+- **Patient link:** OMOP `person.person_source_value` = `DIM_PATIENT.PATIENT_CLINIC_NUMBER`. Note that `PATIENT_DK` is deprecated in some MCP source tables (15 Oct 2026 release); the ECG link still uses it, so that is a question for Tommy Stretch.
+- **Unknown birth year** is stored as 1800. The cohort and the pre-training pool both drop these women, because they cannot be shown to be adults (attrition step "birth year known", report 07 row `excluded_under_min_age_or_birth_year_unknown`).
+- **Primary diagnosis** is already in OMOP: `condition_occurrence.condition_status_concept_id = 32902`, copied from `FACT_DIAGNOSIS.PRIMARY_DIAGNOSIS_FLAG`. The optional MACE rule has a new `mode: omop` (recommended). In `FACT_DIAGNOSIS` the ICD code itself is in `DIM_DIAGNOSIS_CODE` through `DIAGNOSIS_CODE_DK`.
+- **Labs:** the ETL writes each lab result twice (once by LOINC, once by the Mayo description), so the lab queries keep distinct rows.
+- **Death:** OMOP `death` comes only from `DIM_PATIENT.PATIENT_DEATH_DATE`. Deaths more than 60 days before the last clinical activity are dropped, and cause is always 0. The third-party deaths are in `FACT_MORTALITY_STATUS` (open item).
+- **Echo images** are in `FACT_RADIOLOGY_DICOM_INVENTORY` as `MODALITY = 'US'`; search `STUDY_DESCRIPTION` for echo. Fetal echo and TEE are now excluded (`description_exclude`).
+- **Echo test type:** `FACT_ECHO_TEST.ECHO_PERFORMED_TEST_DK` → `DIM_ECHO_TEST` gives the exact test. Match it to the DICOM `STUDY_DESCRIPTION` when a day has more than one echo.
+- **Echo LVEF:** choose the result types in `DIM_ECHO_TEST_RESULT_TYPE` by `ECHO_TEST_RESULT_NAME` / `ECHO_TEST_RESULT_DESCRIPTION`; the value is `FACT_ECHO_RESULTS.ECHO_RESULT_VALUE`. The `reports.echo_lvef` source shows these values to reviewers and the automatic audit as "LVEF nn%"; it stays off until its join key and date column are known.
+- **Still with Tommy Stretch (ECG):** whether each lead and acquisition has exactly one Rhythm row, and which `FACT_ECG` column holds the confirmed (over-read) interpretation.
+
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
 
 In this runbook, `$WB` stands for your workspace's persistent folder (for example `/workbench`). Replace it with the real path.
@@ -107,7 +120,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (67 at the time of writing). It takes about 20 minutes on CPU, less on GPU.
+   Expect every test to pass (77 at the time of writing). It takes about 15–20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -115,17 +128,19 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
 
 Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a handful of real ECG and echo files load cleanly. Everything else in the config is already set to the study protocol.
 
-1. **OMOP schemas.** In the MCP Schema Visualizer, find the schema holding `person`, `condition_occurrence`, `measurement`, and the one holding `concept` and `concept_ancestor`. Set them:
+1. **Datasets.** The config is set for BigQuery, with OMOP in `OMOP_v6_1`, Mayo tables in `mcp` (written as `mcp.FACT_...`) and the work dataset `cardioai_work`. In the data-environment session, check these names against `My_First_Query.ipynb`. If the project must be named, write it in backticks, for example `` `<project>.OMOP_v6_1` ``. If the workspace turns out to be Spark, set `dialect: spark`; nothing else changes.
 
    ```yaml
    platform:
-     cdm_schema: <schema with person etc.>
-     vocab_schema: <schema with concept>
+     dialect: bigquery
+     cdm_schema: OMOP_v6_1
+     vocab_schema: OMOP_v6_1
+     results_schema: cardioai_work
    ```
-2. **Request the imaging.** DICOM files must be requested from `FACT_RADIOLOGY_DICOM_INVENTORY` before they can be read. The inventory's columns are already set in `config/study.yaml` from the MCP Radiology deck; confirm two things first: the table's schema prefix, and that `person.person_source_value` holds `PATIENT_CLINIC_NUMBER` (`platform.person_map`), which is how inventory rows are matched to OMOP patients. Then build the request list:
+2. **Request the imaging.** DICOM files must be requested from `FACT_RADIOLOGY_DICOM_INVENTORY` before they can be read. The inventory's columns are already set in `config/study.yaml` from the MCP Radiology deck; inventory rows are matched to OMOP patients through `person.person_source_value` = `PATIENT_CLINIC_NUMBER` (`platform.person_map`, confirmed by MCP on 28 Oct). Then build the request list:
 
    - instances whose `IMAGE_DEID_STATUS` is Ready or Available (the only ones that can be de-identified);
-   - modality `US` with a cardiac study description (echo; obstetric and vascular ultrasound are left out);
+   - modality `US` with a cardiac study description (echo; obstetric and vascular ultrasound are left out, and so are fetal echo and TEE, which lack the transthoracic views the model reads);
    - for women with a cardiac evaluation, grouped into studies;
    - dated from `FACT_RADIOLOGY.RADIOLOGY_DTM` through the accession number and kept when within −30 to +2 days of an evaluation. Echo studies with no radiology report have no date there; they are kept, since an echo is itself a cardiac evaluation, and dated from the DICOM header once delivered (set `keep_undated: false` to drop them).
 
@@ -140,7 +155,7 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
        --files <delivered folder> --request $WB/imaging/dicom_request.csv --out $WB/imaging/echo_manifest.csv
    ```
 
-   **ECGs:** they are encoded strings in `FACT_ECG_WAVEFORM` (MCP, 21 Oct 2026), and `ecg_table:` and `dim_patient:` are already set for it (`format: mayo_waveform`). Add the schema prefixes, then convert them once to files plus a manifest:
+   **ECGs:** they are encoded strings in `FACT_ECG_WAVEFORM` (MCP, 21 Oct 2026), and `ecg_table:` and `dim_patient:` are already set for it (`format: mayo_waveform`). Convert them once to files plus a manifest:
 
    ```bash
    python -m mcp_adapter.imaging_sources ecg --config config/study.yaml --out $WB/imaging/ecg
@@ -156,17 +171,17 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
 3. **ECG source.** Set `ecg_source.manifest` to the ECG manifest from item 2 and `ecg_source.path` to `null` (its paths are complete). `kind` is already `npy_dir`, which reads the files converted from `FACT_ECG_WAVEFORM`; the code resamples 250 Hz ECGs to 500 Hz. A manifest can also be a platform table, written `sql:<schema.table>`; it needs columns `person_id`, `record_date` and `path`.
 4. **Echo source.** Set `echo_source.manifest` to `$WB/imaging/echo_manifest.csv`, `echo_source.path` to `null` and `kind` to `dicom_dir`. The manifest needs `person_id`, `record_date` and `path`; the `view` column (and optional `ed_frame`, `es_frame`) is added in Step 2b.
 5. **Clinical sign-off.** The clinical reviewer checks every code list in `mcp_adapter/concepts.py` and records approval in the run checklist.
-6. **Check the wiring** in a notebook (the MCP notebook provides the Spark session as `spark`):
+6. **Check the wiring** in a notebook:
 
    ```python
    import sys; sys.path.insert(0, ".")
-   from mcp_adapter.backend import SparkBackend
+   from mcp_adapter.backend import make_backend
    from mcp_adapter.config import StudyConfig
    from mcp_adapter.pipeline import check_imaging_config, _load_manifest
    from mcp_adapter.features.waveforms import load_ecg, load_echo
 
    cfg = StudyConfig.load("config/study.yaml")
-   be = SparkBackend(spark)
+   be = make_backend(cfg)                          # BigQuery client, helper tables in cardioai_work
    check_imaging_config(cfg)                       # raises if a TODO(MCP) is left
    print(be.sql(f"SELECT COUNT(*) n FROM {cfg.vocab_schema}.concept WHERE vocabulary_id='ICD10CM'"))
 
@@ -283,7 +298,7 @@ The approver signs gate 1 here; gates 2 and 3 are signed after Step 4. Request e
 
 ## Step 4 — Build the study tables and review reports 02–06
 
-Goal: the cohort, labels and all five input streams saved inside the workbench, and the reports reviewed before any training. Expect tens of minutes to a few hours depending on Spark cluster size.
+Goal: the cohort, labels and all five input streams saved inside the workbench, and the reports reviewed before any training. Expect tens of minutes to a few hours depending on warehouse load.
 
 ```python
 WB = "/workbench"   # your persistent folder
@@ -509,7 +524,9 @@ Known gap: the app does not yet send ECG, echo, diagnosis history or medications
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `ecg_source is not configured but imaging_required is true` | A TODO(MCP) entry is still empty | Fill `manifest` (and `path`) for ECG and echo in `config/study.yaml` |
-| `imaging manifest ... lacks columns` | MCP's table uses other column names | Create a Spark view renaming them to `person_id`, `record_date`, `path`, `view`; point `manifest` at `sql:<view>` |
+| `imaging manifest ... lacks columns` | MCP's table uses other column names | Create a view in the work dataset renaming them to `person_id`, `record_date`, `path`, `view`; point `manifest` at `sql:<dataset.view>` |
+| `BigQueryBackend needs work_dataset` | `platform.results_schema` is empty | Set it to the project's work dataset (`cardioai_work`) |
+| `Access Denied` / `Not found: Dataset` in BigQuery | Dataset names differ, or the project must be named | Check them in `My_First_Query.ipynb`; write the project in backticks, e.g. `` `<project>.OMOP_v6_1` `` |
 | ICD10CM concept count is 0 | Wrong `vocab_schema` | Find the schema holding `concept` in the Schema Visualizer |
 | Feasibility counts all zero or tiny | Mayo's ETL leaves `condition_source_concept_id` empty | Check `SELECT COUNT(*) ... WHERE condition_source_concept_id > 0`; if empty, the code must match on `condition_source_value` instead — raise it before continuing |
 | Report 05 shows echo for almost nobody | Echo clips have no recognised `view` (records without PLAX/PSAX/A4C/A2C are skipped) | Step 2b was skipped or not finalized; MCP has no view labels to supply, so run Step 2b and point `echo_source.manifest` at the annotated file |

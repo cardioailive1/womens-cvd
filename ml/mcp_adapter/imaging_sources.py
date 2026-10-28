@@ -23,7 +23,7 @@ import pandas as pd
 
 from . import concepts as C
 from . import queries as Q
-from .backend import Backend, days_between
+from .backend import Backend, days_between, regex_match
 from .config import StudyConfig
 from .features.waveforms import leads_from_base64, parse_muse_xml
 from .privacy import suppress, write_report
@@ -82,8 +82,9 @@ def build_dicom_request(be: Backend, cfg: StudyConfig, out_csv: str | Path,
         cond.append(f"UPPER(i.{inv['modality_column']}) IN ({', '.join(q(m.upper()) for m in inv['modalities'])})")
     if inv.get("description_column") and inv.get("description_pattern"):
         col = f"UPPER(i.{inv['description_column']})"
-        pat = inv["description_pattern"].replace("'", "''")
-        cond.append(f"regexp_matches({col}, '{pat}')" if cfg.dialect == "duckdb" else f"{col} RLIKE '{pat}'")
+        cond.append(regex_match(cfg.dialect, col, inv["description_pattern"]))
+        if inv.get("description_exclude"):       # e.g. fetal echo, TEE: not the TTE views the model reads
+            cond.append(f"NOT {regex_match(cfg.dialect, f'COALESCE({col}, {chr(39)}{chr(39)})', inv['description_exclude'])}")
     keys = {"modality": inv["modality_column"], "stmo": inv["stmo_column"], "patient_dk": inv["patient_dk_column"]}
     opt = {k: inv.get(f"{k}_column") for k in ("accession", "description")}
     sel = "".join(f", i.{c} AS {k}" for k, c in keys.items())
@@ -307,10 +308,9 @@ def main(argv=None):
     if a.cmd == "manifest":
         manifest_from_folder(a.files, a.request, a.out, a.modality or None)
         return
-    from pyspark.sql import SparkSession
-    from .backend import SparkBackend
+    from .backend import make_backend
     cfg = StudyConfig.load(a.config)
-    be = SparkBackend(SparkSession.builder.getOrCreate())
+    be = make_backend(cfg)
     if a.cmd == "request":
         build_dicom_request(be, cfg, a.out, submission_csv=a.submission)
     else:

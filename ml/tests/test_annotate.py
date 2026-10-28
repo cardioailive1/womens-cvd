@@ -169,15 +169,29 @@ def test_phenotype_review(tmp_path):
     con.execute("CREATE TABLE fact_echo_test AS SELECT 'MC' || lpad(CAST(person_id AS VARCHAR), 7, '0') "
                 "AS patient_clinic_number, condition_start_date AS echo_date, "
                 "'LVEF 30%. Apical ballooning.' AS echo_note FROM omop_cdm.condition_occurrence LIMIT 300")
+    # structured echo results (MCP, 28 Oct 2026): LVEF picked by result type name; RV EF is not LVEF
+    con.execute("CREATE TABLE dim_echo_test_result_type AS SELECT * FROM (VALUES "
+                "(1, 'LVEF BIPLANE', 'Left ventricular ejection fraction, biplane'), "
+                "(2, 'RV EF', 'Right ventricular ejection fraction'), (3, 'LVIDD', 'LV internal diameter')) "
+                "t(result_type_dk, echo_test_result_name, echo_test_result_description)")
+    con.execute("CREATE TABLE fact_echo_results AS SELECT 'MC' || lpad(CAST(person_id AS VARCHAR), 7, '0') "
+                "AS patient_clinic_number, condition_start_date AS result_date, k AS result_type_dk, "
+                "CASE k WHEN 1 THEN '35' WHEN 2 THEN '20' ELSE '4.9' END AS echo_result_value "
+                "FROM omop_cdm.condition_occurrence, (VALUES (1), (2), (3)) v(k)")
     be = DuckDBBackend(con)
-    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", report_dir=str(tmp_path / "rep"),
+    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", cdm_schema="omop_cdm", vocab_schema="omop_cdm", report_dir=str(tmp_path / "rep"),
                            imaging_required=False)
     assert cfg.report_sources["echo_notes"]["text_column"] == "ECHO_NOTE"
+    lvef = dict(cfg.report_sources["echo_lvef"], results_table="fact_echo_results",
+                result_type_table="dim_echo_test_result_type", result_type_key="result_type_dk",
+                date_column="result_date")
+    assert lvef["kind"] == "echo_results" and lvef["value_column"] == "ECHO_RESULT_VALUE"
     assert "radiology" not in cfg.report_sources                 # off: radiology reports are in OMOP NOTE
     cfg.report_sources = {                       # Mayo-native key, mapped through person_source_value
         "echo_notes": {"table": "fact_echo_test", "person_column": "patient_clinic_number",
                        "person_key": "clinic_number", "date_column": "echo_date", "text_column": "echo_note"},
-        "radiology": {"table": "FACT_RADIOLOGY", "text_column": None, "person_column": None, "date_column": None}}
+        "radiology": {"table": "FACT_RADIOLOGY", "text_column": None, "person_column": None, "date_column": None},
+        "echo_lvef": lvef}
     t = build_study(be, cfg, tmp_path / "study")
     assert (tmp_path / "study" / "code_events.pkl").exists()
 
@@ -186,6 +200,10 @@ def test_phenotype_review(tmp_path):
     ctx = fetch_context(be, cfg, t["cohort"], s.person_id)
     assert len(ctx["diagnoses"]) and len(ctx["notes"])
     assert "echo_notes" in set(ctx["notes"].title)               # Mayo-native report table pulled in
+    ef = ctx["notes"][ctx["notes"].title.astype(str).str.startswith("echo_lvef")]
+    assert len(ef) and set(ef.text) == {"LVEF 35%"}               # RV EF and other results left out
+    from annotate.auto_audit import lvef_values
+    assert lvef_values(ef.text.iloc[0]) == [35.0]                 # the automatic audit can read it
 
     store = AnnotationStore(tmp_path / "pheno.csv")
     rv = PhenotypeReviewer(s, ctx, store, annotator="tester")
