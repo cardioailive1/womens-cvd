@@ -110,3 +110,30 @@ def test_lock_splits_off():
     from mcp_adapter.splits import lock_splits
     df = pd.DataFrame({"person_id": [1], "split": ["train"]})
     assert lock_splits(None, types.SimpleNamespace(split_lock_table=None), df) == (df, {})
+
+
+def test_make_backend_reuses_the_notebook_client(fake_bigquery):
+    c = _FakeClient()
+    cfg = types.SimpleNamespace(dialect="bigquery", results_schema="cardioai_work",
+                                bigquery_project=None, bigquery_location="US")
+    be = make_backend(cfg, client=c)
+    assert be.client is c and be.location == "US" and be.work_dataset == "proj-1.cardioai_work"
+
+
+def test_real_bigquery_client_builds_the_jobs():
+    """With the real google-cloud-bigquery package (no network): the query carries the work dataset
+    as default dataset, and helper tables load into it, replacing any earlier copy."""
+    bq = pytest.importorskip("google.cloud.bigquery")
+    from unittest import mock
+    from google.auth.credentials import AnonymousCredentials
+    client = bq.Client(project="mcp-proj", credentials=AnonymousCredentials())
+    be = BigQueryBackend(client, work_dataset="cardioai_work", location="US")
+    with mock.patch.object(client, "query") as q, mock.patch.object(client, "load_table_from_dataframe") as ld:
+        q.return_value.result.return_value.to_dataframe.return_value = pd.DataFrame({"n": [3]})
+        assert be.sql("SELECT COUNT(*) AS n FROM OMOP_v6_1.person").n.tolist() == [3]
+        jc = q.call_args.kwargs["job_config"]
+        assert str(jc.default_dataset) == "mcp-proj.cardioai_work" and q.call_args.kwargs["location"] == "US"
+        be.register(pd.DataFrame({"person_id": [1]}), "hcman_cohort")
+        dest, = ld.call_args.args[1:2]
+        assert dest == "mcp-proj.cardioai_work.hcman_cohort"
+        assert ld.call_args.kwargs["job_config"].write_disposition == "WRITE_TRUNCATE"

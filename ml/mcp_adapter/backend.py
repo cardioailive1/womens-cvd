@@ -98,10 +98,19 @@ class BigQueryBackend:
         return f"{self.work_dataset}.{name}"
 
 
-def make_backend(cfg):
-    """The backend for cfg.dialect inside the MCP workspace (BigQuery or Spark)."""
+def make_backend(cfg, client=None):
+    """The backend for cfg.dialect inside the MCP workspace (BigQuery or Spark).
+
+    BigQuery: pass the client MCP's notebook already created (`bigquery.Client()` in
+    My_First_Query.ipynb) to reuse its project and credentials; otherwise one is created
+    for platform.bigquery_project (default: the workspace's default project)."""
     if cfg.dialect == "bigquery":
-        return BigQueryBackend(work_dataset=cfg.results_schema)
+        if client is None:
+            from google.cloud import bigquery
+            project = getattr(cfg, "bigquery_project", None)
+            client = bigquery.Client(project=project) if project else bigquery.Client()
+        return BigQueryBackend(client, work_dataset=cfg.results_schema,
+                               location=getattr(cfg, "bigquery_location", None))
     if cfg.dialect == "spark":
         from pyspark.sql import SparkSession
         return SparkBackend(SparkSession.builder.getOrCreate())

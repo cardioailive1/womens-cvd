@@ -21,6 +21,8 @@ class StudyConfig:
     cdm_schema: str = "omop_cdm"
     vocab_schema: str = "omop_cdm"
     results_schema: str | None = None
+    bigquery_project: str | None = None       # None: the workspace's default project
+    bigquery_location: str | None = None
     imaging_required: bool = True
     dicom_inventory: dict = field(default_factory=dict)
     person_map: dict = field(default_factory=dict)
@@ -82,6 +84,8 @@ class StudyConfig:
             cdm_schema=p.get("cdm_schema", "omop_cdm"),
             vocab_schema=p.get("vocab_schema", p.get("cdm_schema", "omop_cdm")),
             results_schema=p.get("results_schema"),
+            bigquery_project=p.get("bigquery_project"),
+            bigquery_location=p.get("bigquery_location"),
             imaging_required=p.get("imaging_required", True),
             dicom_inventory=p.get("dicom_inventory") or {},
             person_map=p.get("person_map") or {},

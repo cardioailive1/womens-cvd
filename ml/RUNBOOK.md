@@ -120,7 +120,7 @@ Goal: the approved code runs end to end on synthetic data inside the workbench b
    python -m pytest tests -q
    ```
 
-   Expect every test to pass (77 at the time of writing). It takes about 15–20 minutes on CPU, less on GPU.
+   Expect every test to pass (80 at the time of writing). It takes about 15–20 minutes on CPU, less on GPU.
 
 **Go when:** all tests pass. If any fail, stop and see Troubleshooting; do not continue to real data.
 
@@ -181,7 +181,10 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
    from mcp_adapter.features.waveforms import load_ecg, load_echo
 
    cfg = StudyConfig.load("config/study.yaml")
-   be = make_backend(cfg)                          # BigQuery client, helper tables in cardioai_work
+   from google.cloud import bigquery
+   client = bigquery.Client()                      # as in MCP's My_First_Query.ipynb (provisioned project)
+   be = make_backend(cfg, client)                  # all study SQL runs through this client;
+                                                   #   helper tables go to cardioai_work
    check_imaging_config(cfg)                       # raises if a TODO(MCP) is left
    print(be.sql(f"SELECT COUNT(*) n FROM {cfg.vocab_schema}.concept WHERE vocabulary_id='ICD10CM'"))
 

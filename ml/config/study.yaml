@@ -10,6 +10,11 @@ platform:
   cdm_schema: OMOP_v6_1          # OMOP CDM dataset
   vocab_schema: OMOP_v6_1        # where CONCEPT / CONCEPT_ANCESTOR live
   results_schema: cardioai_work  # writable work dataset: helper tables and the locked splits
+  # Queries run through the BigQuery Python client against the data MCP provisioned for the
+  # project. make_backend(cfg, client) reuses the notebook's client; otherwise it creates one for
+  # this project (null = the workspace's default project and credentials).
+  bigquery_project: null         # TODO(MCP): only if the default project is not the data project
+  bigquery_location: null        # e.g. US; null = BigQuery's default
   # Imaging is CONFIRMED available under the Cardio AI MCP contract and is REQUIRED for this
   # study (imaging_required: true). Fill in where MCP exposes it — ask the MCP mentor for the
   # table or bucket names; the rest of the pipeline does not change.
