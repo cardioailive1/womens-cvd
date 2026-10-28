@@ -482,9 +482,8 @@ def main(argv=None):
             src.manifest = a.manifest
         be = None
         if str(src.manifest).startswith("sql:"):
-            from pyspark.sql import SparkSession
-            from mcp_adapter.backend import SparkBackend
-            be = SparkBackend(SparkSession.builder.getOrCreate())
+            from mcp_adapter.backend import make_backend
+            be = make_backend(cfg)
         return _load_manifest(src, be)
 
     if a.cmd == "train-views":

@@ -2,10 +2,19 @@
 # Every value here is read by mcp_adapter.config.StudyConfig. Change values, not code.
 
 platform:
-  dialect: spark                 # spark (MCP workbench) | duckdb (local synthetic tests)
-  cdm_schema: omop_cdm           # OMOP CDM schema name — confirm in MCP Schema Visualizer
-  vocab_schema: omop_cdm         # where CONCEPT / CONCEPT_ANCESTOR live (often same schema)
-  results_schema: hcman_results  # writable scratch schema for cohort tables, if MCP grants one
+  # MCP's OMOP ETL guide (28 Oct 2026): the warehouse is BigQuery. Mayo-native FACT_* / DIM_*
+  # tables are in dataset `mcp`, OMOP CDM v5.4 (with its vocabulary) in `OMOP_v6_1`. Projects can
+  # write saved tables to a work dataset (MCP, 28 Oct 2026; shown in My_First_Query.ipynb).
+  # TODO(MCP): confirm the dataset names (and any project prefix) in the data-environment session.
+  dialect: bigquery              # bigquery (MCP warehouse) | spark | duckdb (local synthetic tests)
+  cdm_schema: OMOP_v6_1          # OMOP CDM dataset
+  vocab_schema: OMOP_v6_1        # where CONCEPT / CONCEPT_ANCESTOR live
+  results_schema: cardioai_work  # writable work dataset: helper tables and the locked splits
+  # Queries run through the BigQuery Python client against the data MCP provisioned for the
+  # project. make_backend(cfg, client) reuses the notebook's client; otherwise it creates one for
+  # this project (null = the workspace's default project and credentials).
+  bigquery_project: null         # TODO(MCP): only if the default project is not the data project
+  bigquery_location: null        # e.g. US; null = BigQuery's default
   # Imaging is CONFIRMED available under the Cardio AI MCP contract and is REQUIRED for this
   # study (imaging_required: true). Fill in where MCP exposes it — ask the MCP mentor for the
   # table or bucket names; the rest of the pipeline does not change.
@@ -14,7 +23,7 @@ platform:
   # and must be requested (MCP, 15 Oct 2026). Column names below are from the MCP Radiology deck.
   # `python -m mcp_adapter.imaging_sources request` builds the study-level request list.
   dicom_inventory:
-    table: FACT_RADIOLOGY_DICOM_INVENTORY   # TODO(MCP): add the schema prefix if needed
+    table: mcp.FACT_RADIOLOGY_DICOM_INVENTORY   # echo is listed here as MODALITY 'US' (MCP, 28 Oct)
     patient_column: PATIENT_CLINIC_NUMBER   # Mayo clinic number, mapped to OMOP via person_map below
     patient_dk_column: PATIENT_DK           # required in the de-identification submission CSV
     study_uid_column: STUDY_INSTANCE_UID
@@ -26,25 +35,29 @@ platform:
     deid_status_column: IMAGE_DEID_STATUS
     deid_ok: [Ready, Available]             # only these can be submitted for de-identification
     modalities: [US]                        # US = echo (also obstetric, vascular... filtered below)
-    description_pattern: "ECHO|TTE|TRANSTHORACIC|CARDIAC|HEART"
+    description_pattern: "ECHO|TTE|TRANSTHORACIC|CARDIAC|HEART"   # MCP: search STUDY_DESCRIPTION for echo
+    # The model reads transthoracic views (PLAX, PSAX, A4C, A2C): drop fetal echo (pregnancy
+    # strata) and transoesophageal studies. Check report 05 for descriptions still let through.
+    description_exclude: "FETAL|FETUS|TEE|TRANSESOPH|TRANSOESOPH|OB "
     window_days: [-30, 2]                   # study date relative to a cardiac evaluation
     keep_undated: true                      # echo is itself a cardiac evaluation: keep studies
                                             #   whose date cannot be found rather than drop them
     # The inventory has no study date. Take it from FACT_RADIOLOGY via the accession number
     # (radiology-read studies); echo studies without a radiology report stay undated.
     date_source: fact_radiology             # fact_radiology | inventory | none
-    date_table: FACT_RADIOLOGY              # TODO(MCP): add the schema prefix if needed
+    date_table: mcp.FACT_RADIOLOGY
     date_accession_column: ACCESSION_NBR
     date_column: RADIOLOGY_DTM              # when the imaging was performed (not RADIOLOGY_REVIEW_DTM)
-  # Mayo-native tables key patients by PATIENT_CLINIC_NUMBER; OMOP uses person_id. This is the
-  # OMOP person column holding the (de-identified) clinic number.
+  # Mayo-native tables key patients by PATIENT_CLINIC_NUMBER; OMOP uses person_id. MCP (28 Oct
+  # 2026) and the OMOP guide: person.person_source_value = DIM_PATIENT.PATIENT_CLINIC_NUMBER.
   person_map:
-    clinic_number_column: person_source_value   # TODO(MCP): confirm this mapping
+    clinic_number_column: person_source_value
   # Mayo patient dimension: one row per PATIENT_DK (per medical-record system). PATIENT_CLINIC_NUMBER
   # is the same person across systems (MCP, 21 Oct 2026), so it is the person-level key; one row
-  # per person is PATIENT_MERGED_FLAG = 'N'.
+  # per person is PATIENT_MERGED_FLAG = 'N'. Note (OMOP guide, 15 Oct 2026 release): PATIENT_DK is
+  # deprecated in some MCP source tables; the ECG link below still uses it (asked of Tommy Stretch).
   dim_patient:
-    table: DIM_PATIENT               # TODO(MCP): add the schema prefix if needed
+    table: mcp.DIM_PATIENT
     dk_column: PATIENT_DK
     clinic_number_column: PATIENT_CLINIC_NUMBER
     merged_flag_column: PATIENT_MERGED_FLAG
@@ -57,7 +70,7 @@ platform:
   # interpretation): PATIENT_DK via DIM_PATIENT, ACQUISITION_TS = ECG_DTM.
   # `python -m mcp_adapter.imaging_sources ecg` converts them to files + a manifest.
   ecg_table:
-    table: FACT_ECG_WAVEFORM         # TODO(MCP): add the schema prefix if needed
+    table: mcp.FACT_ECG_WAVEFORM
     format: mayo_waveform            # mayo_waveform | muse_xml | lead_base64
     person_column: PATIENT_DK        # joined to DIM_PATIENT, then to OMOP through person_map
     date_column: ACQUISITION_TS      # one acquisition = PATIENT_DK + ACQUISITION_TS
@@ -67,9 +80,9 @@ platform:
     rhythm_value: Rhythm
     url_encoded: true
     units_per_bit: 4.88              # counts -> microvolts
-    sample_rate_table: FACT_ECG_WAVEFORM_RESTING_MEASUREMENT   # TODO(MCP): schema prefix
+    sample_rate_table: mcp.FACT_ECG_WAVEFORM_RESTING_MEASUREMENT
     sample_rate_column: ECGSAMPLEBASE
-    sample_rate_keys: [PATIENT_DK, ACQUISITION_TS]   # TODO(MCP): confirm the join keys
+    sample_rate_keys: [PATIENT_DK, ACQUISITION_TS]   # TODO(MCP, Tommy Stretch): confirm the join keys
   ecg_source:
     kind: npy_dir                # the .npz files written by `imaging_sources ecg`
     path: null                   # set to the extraction output folder (e.g. $WB/ecg_npz)
@@ -84,8 +97,10 @@ platform:
 study:
   study_start: "2010-01-01"      # de-identified dates are shifted uniformly; windows use relative days only
   study_end: "2025-12-31"
-  min_age: 18
+  min_age: 18                    # adults only: paediatric patients are excluded
   max_age_pregnancy_strata: 55
+  unknown_birth_year: 1800       # MCP OMOP stores redacted / unknown birth years as 1800 (month, day
+                                 #   NULL); these women are excluded because age >= 18 cannot be shown
   lookback_days: 365             # inputs come from [index - lookback, index]
   ecg_echo_window_days: [-30, 2] # nearest ECG / echo to index within this window
   labs_window_days: 90           # stream 5 serial-lab window, ending at index
@@ -101,14 +116,35 @@ reports:
   # in the OMOP NOTE table (MCP Radiology deck), which chart review reads by default, so the
   # FACT_RADIOLOGY source is off to avoid showing each report twice. Echo notes are Mayo-native.
   echo_notes:
-    table: FACT_ECHO_TEST          # TODO(MCP): add the schema prefix if needed
+    table: mcp.FACT_ECHO_TEST
     text_column: ECHO_NOTE         # MCP: "Echo Notes are in FACT_ECHO_TEST.ECHO_NOTE"
     person_column: PATIENT_CLINIC_NUMBER   # TODO(MCP): confirm (the Mayo-native patient key)
     person_key: clinic_number      # clinic_number (mapped via platform.person_map) | person_id
     date_column: null              # TODO(MCP): echo date column
+    # Exact test performed (TTE / TEE / stress), MCP 28 Oct 2026: FACT_ECHO_TEST.ECHO_PERFORMED_TEST_DK
+    # joins DIM_ECHO_TEST; match it to the DICOM STUDY_DESCRIPTION when a day has several echos.
+    performed_test_dk_column: ECHO_PERFORMED_TEST_DK
+    test_dim_table: mcp.DIM_ECHO_TEST
+  # Structured LVEF (MCP, 28 Oct 2026): result types in DIM_ECHO_TEST_RESULT_TYPE, chosen by
+  # ECHO_TEST_RESULT_NAME / ECHO_TEST_RESULT_DESCRIPTION; the value is FACT_ECHO_RESULTS.
+  # ECHO_RESULT_VALUE. Shown to reviewers and the automatic audit as "LVEF nn%" note rows, one per
+  # LVEF type (biplane, visual, 3-D). Skipped until the TODO columns are filled in.
+  echo_lvef:
+    kind: echo_results
+    results_table: mcp.FACT_ECHO_RESULTS
+    result_type_table: mcp.DIM_ECHO_TEST_RESULT_TYPE
+    result_type_key: null          # TODO(MCP): key joining FACT_ECHO_RESULTS to DIM_ECHO_TEST_RESULT_TYPE
+    name_column: ECHO_TEST_RESULT_NAME
+    description_column: ECHO_TEST_RESULT_DESCRIPTION
+    value_column: ECHO_RESULT_VALUE
+    match_pattern: "LVEF|EJECTION FRACTION"
+    exclude_pattern: "RIGHT|RV "   # not right-ventricular EF
+    person_column: PATIENT_CLINIC_NUMBER   # TODO(MCP): confirm
+    person_key: clinic_number
+    date_column: null              # TODO(MCP): result date column (or via FACT_ECHO_TEST)
   radiology:
     enabled: false                 # already in OMOP NOTE; turn on only if NOTE lacks them
-    table: FACT_RADIOLOGY
+    table: mcp.FACT_RADIOLOGY
     text_column: RADIOLOGY_REPORT
     person_column: PATIENT_CLINIC_NUMBER   # TODO(MCP): confirm
     person_key: clinic_number
@@ -149,19 +185,27 @@ training:
     cardiologist_pair_kappa: 0.80
 
 outcomes:
-  # Optional MACE rule: count an MI or stroke code only when it is also a PRIMARY diagnosis in Mayo
-  # FACT_DIAGNOSIS (PRIMARY_DIAGNOSIS_FLAG; MCP, 21 Oct 2026). It removes history-of and rule-out
-  # codes recorded as secondary, but misses real events coded only as secondary. Off by default;
-  # the clinical lead decides. Heart failure keeps its inpatient/ED rule; death is all-cause.
+  # Optional MACE rule: count an MI or stroke code only when it is also a PRIMARY diagnosis. It
+  # removes history-of and rule-out codes recorded as secondary, but misses real events coded only
+  # as secondary. Off by default; the clinical lead decides. Heart failure keeps its inpatient/ED
+  # rule; death is all-cause. Two sources, same flag:
+  #   omop           - condition_occurrence.condition_status_concept_id = 32902 "Primary diagnosis";
+  #                    MCP's ETL sets it from FACT_DIAGNOSIS.PRIMARY_DIAGNOSIS_FLAG = 'Y' (OMOP guide,
+  #                    28 Oct 2026). Recommended: no Mayo-native join needed.
+  #   fact_diagnosis - Mayo FACT_DIAGNOSIS directly; the code is in DIM_DIAGNOSIS_CODE via
+  #                    DIAGNOSIS_CODE_DK (column names from the OMOP guide's Source Tables sheet).
   mace_primary_diagnosis:
-    mode: "off"                    # off | fact_diagnosis
-    table: FACT_DIAGNOSIS          # TODO(MCP): schema prefix
-    patient_key: patient_dk        # patient_dk (via dim_patient) | clinic_number
-    patient_column: PATIENT_DK     # TODO(MCP): confirm
-    date_column: DIAGNOSIS_DTM     # TODO(MCP): the diagnosis date column
-    code_column: DIAGNOSIS_CODE    # TODO(MCP): the ICD-10 code column
+    mode: "off"                    # off | omop | fact_diagnosis
+    status_concept_id: 32902       # omop mode
+    table: mcp.FACT_DIAGNOSIS      # fact_diagnosis mode, below
+    patient_key: clinic_number     # clinic_number | patient_dk (via dim_patient)
+    patient_column: PATIENT_CLINIC_NUMBER
+    date_column: DIAGNOSIS_DTM
+    code_dim_table: mcp.DIM_DIAGNOSIS_CODE
+    code_dk_column: DIAGNOSIS_CODE_DK
+    code_column: DIAGNOSIS_CODE    # in code_dim_table (or in the fact table if code_dim_table is null)
     flag_column: PRIMARY_DIAGNOSIS_FLAG
-    flag_value: "Y"                # TODO(MCP): confirm the value that means primary
+    flag_value: "Y"
     match_days: 1                  # the primary diagnosis must be within this many days of the code
     applies_to: [out_mi, out_stroke]
 
@@ -183,6 +227,10 @@ splits:
   val_fraction: 0.15
   temporal_holdout_after_day: null   # optional: index days (shifted) after this go to a temporal test set
   seed: 20261013
+  # Locked split, saved in the work dataset (platform.results_schema) on the first build and reused
+  # after: validation / test women stay there across rebuilds and data refreshes (report 03b).
+  # Never delete it once the validation set has been looked at. null = no locking (local tests).
+  lock_table: hcman_locked_splits
 
 privacy:
   min_cell_size: 11              # suppress any reported count below this (MCP sets the official threshold)

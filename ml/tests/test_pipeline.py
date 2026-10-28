@@ -43,8 +43,11 @@ def _imaging(tmp: Path, cohort: pd.DataFrame, n: int = 40):
 def study(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("study")
     con = duckdb.connect(); load_into_duckdb(con)
+    # MCP OMOP stores unknown birth years as 1800; and a few girls under 18 must never enter
+    con.execute("UPDATE omop_cdm.person SET year_of_birth = 1800 WHERE person_id % 40 = 0")
+    con.execute("UPDATE omop_cdm.person SET year_of_birth = 2012 WHERE person_id % 40 = 1")
     be = DuckDBBackend(con)
-    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", report_dir=str(tmp / "reports"),
+    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", cdm_schema="omop_cdm", vocab_schema="omop_cdm", report_dir=str(tmp / "reports"),
                            imaging_required=False)   # first pass only: manifests need the cohort
     feas = run_feasibility(be, cfg)
     t = build_study(be, cfg, tmp / "tables")
@@ -71,6 +74,21 @@ def test_pretraining_pool_excludes_eval_women(study):
     assert not pool.person_id.isin(held).any()
     assert pool.person_id.isin(co[co.split == "train"].person_id).any()
     assert len(study["pool"]["ecg_records"]) > 0 and len(study["pool"]["echo_records"]) > 0
+
+
+def test_adults_only_with_known_birth_year(study):
+    """Cohort and pre-training pool: no unknown birth year (1800), nobody under 18 at index."""
+    unknown = set(study["con"].execute("SELECT person_id FROM omop_cdm.person WHERE year_of_birth = 1800").df().person_id)
+    girls = set(study["con"].execute("SELECT person_id FROM omop_cdm.person WHERE year_of_birth = 2012").df().person_id)
+    assert unknown and girls
+    co, pool = study["tables"]["cohort"], study["pool"]["pool"]
+    for df in (co, pool):
+        assert not df.person_id.isin(unknown | girls).any()
+    assert (co.age >= 18).all()
+    rep = pd.read_csv(study["tmp"] / "reports" / "07_pretraining_pool.csv").set_index("item")
+    assert "excluded_under_min_age_or_birth_year_unknown" in rep.index
+    attr = pd.read_csv(study["tmp"] / "reports" / "02_attrition.csv")
+    assert attr.step.str.startswith("birth year known").any()
 
 
 # ------------------------------------------------------------------ cohort

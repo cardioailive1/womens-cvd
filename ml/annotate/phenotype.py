@@ -119,7 +119,7 @@ FROM {cdm}.procedure_occurrence x JOIN {REVIEW_VIEW} w ON w.person_id = x.person
 JOIN {voc}.concept c ON c.concept_id = x.procedure_concept_id
 WHERE {d('x.procedure_date')} BETWEEN {lo} AND {hi}""")
     labs = be.sql(f"""
-SELECT x.person_id, {d('x.measurement_date')} AS rel_day, c.concept_name AS name,
+SELECT DISTINCT x.person_id, {d('x.measurement_date')} AS rel_day, c.concept_name AS name,
        x.value_as_number AS value, x.unit_source_value AS unit
 FROM {cdm}.measurement x JOIN {REVIEW_VIEW} w ON w.person_id = x.person_id
 JOIN {voc}.concept c ON c.concept_id = x.measurement_concept_id
@@ -133,8 +133,8 @@ FROM {cdm}.note x JOIN {REVIEW_VIEW} w ON w.person_id = x.person_id
 WHERE {d('x.note_date')} BETWEEN {lo} AND {hi}""")
     except Exception:          # NOTE table not exposed on this platform/schema
         notes = pd.DataFrame(columns=["person_id", "rel_day", "title", "text"])
-    parts = [notes] + [report_notes(be, cfg, name, src, lo, hi)
-                       for name, src in cfg.report_sources.items()]
+    parts = [notes] + [(echo_result_notes if src.get("kind") == "echo_results" else report_notes)
+                       (be, cfg, name, src, lo, hi) for name, src in cfg.report_sources.items()]
     notes = pd.concat([p for p in parts if len(p)] or [notes], ignore_index=True)
     return {"diagnoses": dx, "procedures": px, "labs": labs, "notes": notes}
 
@@ -159,6 +159,47 @@ def report_notes(be: Backend, cfg: StudyConfig, name: str, src: dict, lo: int, h
 SELECT {pid} AS person_id, {d} AS rel_day, '{name}' AS title, r.{src['text_column']} AS text
 FROM {src['table']} r {join}
 WHERE {d} BETWEEN {lo} AND {hi}""")
+    except Exception as e:
+        import logging
+        logging.getLogger("annotate.phenotype").warning("report source %s skipped: %s", name, e)
+        return empty
+
+
+def echo_result_notes(be: Backend, cfg: StudyConfig, name: str, src: dict, lo: int, hi: int) -> pd.DataFrame:
+    """Structured echo LVEF as note rows ("LVEF 35%") so the automatic audit and reviewers see it
+    beside the free text. MCP (28 Oct 2026): pick the LVEF result types in DIM_ECHO_TEST_RESULT_TYPE
+    by ECHO_TEST_RESULT_NAME / ECHO_TEST_RESULT_DESCRIPTION; the value is FACT_ECHO_RESULTS.
+    ECHO_RESULT_VALUE. A study can carry several LVEFs (biplane, visual, 3-D): each is kept with
+    its result name in the title. Skipped, not failed, until every column is configured."""
+    from mcp_adapter.backend import regex_match
+    empty = pd.DataFrame(columns=["person_id", "rel_day", "title", "text"])
+    need = ("results_table", "result_type_table", "result_type_key", "name_column", "value_column",
+            "person_column", "date_column", "match_pattern")
+    if not all(src.get(k) for k in need):
+        return empty
+    d = days_between(cfg.dialect, f"r.{src['date_column']}", "w.index_date")
+    label = f"UPPER(CONCAT(COALESCE(CAST(t.{src['name_column']} AS STRING), ''), ' ', " \
+            f"COALESCE(CAST(t.{src.get('description_column') or src['name_column']} AS STRING), '')))"
+    cond = [regex_match(cfg.dialect, label, src["match_pattern"])]
+    if src.get("exclude_pattern"):
+        cond.append(f"NOT {regex_match(cfg.dialect, label, src['exclude_pattern'])}")
+    try:
+        from mcp_adapter.imaging_sources import person_join
+        if src.get("person_key", "clinic_number") == "clinic_number":
+            join = (f"{person_join(cfg, 'pm', 'r.' + src['person_column'])} "
+                    f"JOIN {REVIEW_VIEW} w ON w.person_id = pm.person_id")
+            pid = "pm.person_id"
+        else:
+            join, pid = f"JOIN {REVIEW_VIEW} w ON w.person_id = r.{src['person_column']}", f"r.{src['person_column']}"
+        key = src["result_type_key"]
+        return be.sql(f"""
+SELECT DISTINCT {pid} AS person_id, {d} AS rel_day,
+       CONCAT('{name}: ', CAST(t.{src['name_column']} AS STRING)) AS title,
+       CONCAT('LVEF ', CAST(r.{src['value_column']} AS STRING), '%') AS text
+FROM {src['results_table']} r
+JOIN {src['result_type_table']} t ON t.{key} = r.{key}
+{join}
+WHERE r.{src['value_column']} IS NOT NULL AND {' AND '.join(cond)} AND {d} BETWEEN {lo} AND {hi}""")
     except Exception as e:
         import logging
         logging.getLogger("annotate.phenotype").warning("report source %s skipped: %s", name, e)

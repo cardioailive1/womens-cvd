@@ -42,6 +42,15 @@ def _earliest_eval_in(evals: pd.DataFrame, anchor: pd.Series, lo: int, hi: int,
     return out
 
 
+def known_birth_year(yob: pd.Series, cfg: StudyConfig) -> pd.Series:
+    """False where the birth year is missing or the platform's unknown marker (MCP OMOP stores
+    redacted birth years as 1800, month and day NULL). Such women cannot be shown to be adults."""
+    ok = yob.notna()
+    if cfg.unknown_birth_year is not None:
+        ok &= yob != cfg.unknown_birth_year
+    return ok
+
+
 def build_candidates(ev: pd.DataFrame, evals: pd.DataFrame, people: pd.DataFrame,
                      cfg: StudyConfig) -> pd.DataFrame:
     """One row per (person, stratum) with that stratum's index date."""
@@ -121,6 +130,8 @@ def apply_eligibility(cands: pd.DataFrame, ev: pd.DataFrame, people: pd.DataFram
     excl = set(ev.loc[ev.grp == "excl", "person_id"])
     df = df[~df.person_id.isin(excl)]; log("after congenital HD / transplant exclusion", df)
 
+    df = df[known_birth_year(df.year_of_birth, cfg)]
+    log("birth year known (adults only: age must be verifiable)", df)
     df["age"] = df.index_date.dt.year - df.year_of_birth
     ok_age = df.age >= cfg.min_age
     preg_strata = df.stratum.isin(["A_pregnant_high_risk", "B_postpartum"])

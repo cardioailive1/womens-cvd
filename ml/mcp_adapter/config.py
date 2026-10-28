@@ -21,6 +21,8 @@ class StudyConfig:
     cdm_schema: str = "omop_cdm"
     vocab_schema: str = "omop_cdm"
     results_schema: str | None = None
+    bigquery_project: str | None = None       # None: the workspace's default project
+    bigquery_location: str | None = None
     imaging_required: bool = True
     dicom_inventory: dict = field(default_factory=dict)
     person_map: dict = field(default_factory=dict)
@@ -33,6 +35,7 @@ class StudyConfig:
     study_end: str = "2025-12-31"
     min_age: int = 18
     max_age_pregnancy_strata: int = 55
+    unknown_birth_year: int | None = 1800     # MCP OMOP: redacted / unknown birth years are stored as 1800
     lookback_days: int = 365
     ecg_echo_window_days: tuple[int, int] = (-30, 2)
     labs_window_days: int = 90
@@ -51,6 +54,7 @@ class StudyConfig:
     test_fraction: float = 0.15
     val_fraction: float = 0.15
     temporal_holdout_after_day: int | None = None
+    split_lock_table: str | None = None
     seed: int = 20261013
 
     min_cell_size: int = 11
@@ -80,6 +84,8 @@ class StudyConfig:
             cdm_schema=p.get("cdm_schema", "omop_cdm"),
             vocab_schema=p.get("vocab_schema", p.get("cdm_schema", "omop_cdm")),
             results_schema=p.get("results_schema"),
+            bigquery_project=p.get("bigquery_project"),
+            bigquery_location=p.get("bigquery_location"),
             imaging_required=p.get("imaging_required", True),
             dicom_inventory=p.get("dicom_inventory") or {},
             person_map=p.get("person_map") or {},
@@ -91,6 +97,7 @@ class StudyConfig:
             study_end=s.get("study_end", "2025-12-31"),
             min_age=s.get("min_age", 18),
             max_age_pregnancy_strata=s.get("max_age_pregnancy_strata", 55),
+            unknown_birth_year=s.get("unknown_birth_year", 1800),
             lookback_days=s.get("lookback_days", 365),
             ecg_echo_window_days=tuple(s.get("ecg_echo_window_days", (-30, 2))),
             labs_window_days=s.get("labs_window_days", 90),
@@ -107,6 +114,7 @@ class StudyConfig:
             test_fraction=sp.get("test_fraction", 0.15),
             val_fraction=sp.get("val_fraction", 0.15),
             temporal_holdout_after_day=sp.get("temporal_holdout_after_day"),
+            split_lock_table=sp.get("lock_table"),
             seed=sp.get("seed", 20261013),
             min_cell_size=pv.get("min_cell_size", 11),
             report_dir=pv.get("report_dir", "reports"),

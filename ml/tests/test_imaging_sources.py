@@ -26,7 +26,7 @@ def db():
 
 
 def cfg_for(tmp_path, **kw):
-    return StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", report_dir=str(tmp_path / "rep"), **kw)
+    return StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", cdm_schema="omop_cdm", vocab_schema="omop_cdm", report_dir=str(tmp_path / "rep"), **kw)
 
 
 def test_request_needs_columns(db, tmp_path):
@@ -58,12 +58,15 @@ def test_dicom_request_list(db, tmp_path):
         study("CT", "CT", "CT CHEST", date=d)                                   # wrong modality
         study("OB", "US", "OB ULTRASOUND", date=d)                              # not cardiac
         study("NA", "US", "TTE ECHO", status="Not Available", date=d)            # cannot be de-identified
+        study("FETAL", "US", "FETAL ECHOCARDIOGRAM", date=d)                    # fetal heart: excluded
+        study("TEE", "US", "TEE ECHO WITH CONTRAST", date=d)                     # transoesophageal: excluded
     cols = ["PATIENT_CLINIC_NUMBER", "PATIENT_DK", "STUDY_INSTANCE_UID", "SERIES_INSTANCE_UID", "SOP_INSTANCE_UID",
             "DICOM_ACCESSION_NUMBER", "MODALITY", "STMO_NAME_IN_ADL", "STUDY_DESCRIPTION", "IMAGE_DEID_STATUS"]
     db.register("inv_df", pd.DataFrame(inv, columns=cols))
-    db.execute("CREATE OR REPLACE TABLE FACT_RADIOLOGY_DICOM_INVENTORY AS SELECT * FROM inv_df")
+    db.execute("CREATE SCHEMA IF NOT EXISTS mcp")             # Mayo-native dataset name in BigQuery
+    db.execute("CREATE OR REPLACE TABLE mcp.FACT_RADIOLOGY_DICOM_INVENTORY AS SELECT * FROM inv_df")
     db.register("rad_df", pd.DataFrame(rad, columns=["ACCESSION_NBR", "RADIOLOGY_DTM"]))
-    db.execute("CREATE OR REPLACE TABLE FACT_RADIOLOGY AS SELECT * FROM rad_df")
+    db.execute("CREATE OR REPLACE TABLE mcp.FACT_RADIOLOGY AS SELECT * FROM rad_df")
 
     cfg = cfg_for(tmp_path)                                    # shipped config, nothing overridden
     req = build_dicom_request(DuckDBBackend(db), cfg, tmp_path / "req.csv")
@@ -171,7 +174,7 @@ def test_extract_mayo_fact_ecg_waveform(db, tmp_path):
     for t, src in (("fact_ecg_waveform", "w_df"), ("dim_patient", "d_df"), ("fact_ecg_meas", "m_df")):
         db.execute(f"CREATE OR REPLACE TABLE {t} AS SELECT * FROM {src}")
     cfg = cfg_for(tmp_path)
-    assert cfg.ecg_table["format"] == "mayo_waveform" and cfg.dim_patient["table"] == "DIM_PATIENT"
+    assert cfg.ecg_table["format"] == "mayo_waveform" and cfg.dim_patient["table"] == "mcp.DIM_PATIENT"
     cfg.ecg_table.update(table="fact_ecg_waveform", sample_rate_table="fact_ecg_meas")
     cfg.dim_patient.update(table="dim_patient")
     man = extract_ecg_table(DuckDBBackend(db), cfg, tmp_path / "ecg", person_ids=people.person_id.tolist())

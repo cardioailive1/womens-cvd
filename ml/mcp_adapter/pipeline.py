@@ -13,14 +13,14 @@ import pandas as pd
 from . import concepts as C
 from . import queries as Q
 from .backend import Backend
-from .cohort import apply_eligibility, build_candidates, stratum_shortfall
+from .cohort import apply_eligibility, build_candidates, known_birth_year, stratum_shortfall
 from .config import StudyConfig
 from .features.labs_ehr import harmonize_units
 from .features.repro import REPRO_PROVENANCE, build_repro
 from .features.waveforms import nearest_record
 from .labels import build_labels
 from .privacy import suppress, write_report
-from .splits import make_splits
+from .splits import lock_splits, make_splits
 
 log = logging.getLogger("hcman.pipeline")
 
@@ -94,7 +94,10 @@ def build_study(be: Backend, cfg: StudyConfig, out_dir: str | Path) -> dict[str,
     tokens = Q.cohort_ehr_tokens(be, cfg)
     tox = Q.cohort_cardiotoxic_drugs(be, cfg)
 
-    if (cfg.mace_primary or {}).get("mode", "off") == "fact_diagnosis":
+    mode = str((cfg.mace_primary or {}).get("mode", "off"))
+    if mode not in ("off", "omop", "fact_diagnosis"):
+        raise ValueError(f"outcomes.mace_primary_diagnosis.mode must be off, omop or fact_diagnosis, not {mode!r}")
+    if mode != "off":
         from .labels import require_primary
         mp = cfg.mace_primary
         ev, dropped = require_primary(ev, Q.primary_diagnoses(be, cfg),
@@ -107,6 +110,10 @@ def build_study(be: Backend, cfg: StudyConfig, out_dir: str | Path) -> dict[str,
     labels = build_labels(ev, cohort, cfg)
     repro = build_repro(ev, cohort, tox)
     split = make_splits(cohort, labels, cfg).rename("split").reset_index()
+    split, lock = lock_splits(be, cfg, split)
+    if lock:
+        write_report(suppress(pd.DataFrame([{"item": k, "n_women": v} for k, v in lock.items()]),
+                              ["n_women"], cfg.min_cell_size), "03b_split_lock", cfg.report_dir)
     cohort = cohort.merge(split, on="person_id")
 
     ecg_sel, echo_sel = _imaging_selection(be, cfg, cohort)
@@ -174,6 +181,15 @@ def build_pretraining_pool(be: Backend, cfg: StudyConfig, cohort: pd.DataFrame,
     ev = Q.cardiac_eval_events(be, cfg)
     ev["event_date"] = pd.to_datetime(ev.event_date)
     pool = ev[~ev.person_id.isin(held_out)].groupby("person_id").event_date.max().rename("index_date").reset_index()
+    # adults only, as in the cohort: age >= min_age at the pseudo-index, birth year known
+    people = Q.persons(be, cfg).drop_duplicates("person_id")[["person_id", "year_of_birth"]]
+    pool = pool.merge(people, on="person_id", how="inner")
+    n_before = len(pool)
+    pool = pool[known_birth_year(pool.year_of_birth, cfg)
+                & (pool.index_date.dt.year - pool.year_of_birth >= cfg.min_age)]
+    pool = pool.drop(columns="year_of_birth")
+    n_adult = len(pool)
+    log.info("pre-training pool: %d of %d women kept as adults with a known birth year", n_adult, n_before)
     if len(pool) > cfg.pretrain["max_women"]:
         pool = pool.sample(cfg.pretrain["max_women"], random_state=cfg.seed)
     Q.register_cohort(be, pool)
@@ -190,5 +206,6 @@ def build_pretraining_pool(be: Backend, cfg: StudyConfig, cohort: pd.DataFrame,
         {"item": "with_ecg", "n_women": int(pool.person_id.isin(ecg_sel.person_id).sum())},
         {"item": "with_echo", "n_women": int(pool.person_id.isin(echo_sel.person_id).sum())},
         {"item": "excluded_val_test", "n_women": len(held_out)},
+        {"item": "excluded_under_min_age_or_birth_year_unknown", "n_women": n_before - n_adult},
     ]), ["n_women"], k), "07_pretraining_pool", cfg.report_dir)
     return tables

@@ -11,7 +11,7 @@ go / no-go gates, troubleshooting and a run checklist. This README is the short 
 config/study.yaml        every study parameter (windows, thresholds, sources, splits)
 mcp_adapter/             OMOP CDM v5.4 -> HCMAN inputs (runs inside the MCP workbench)
   concepts.py            ICD-10-CM / LOINC / RxNorm / CPT4 concept sets  <- clinical review
-  queries.py             portable Spark SQL / DuckDB extraction (two passes)
+  queries.py             portable SQL extraction: BigQuery / Spark / DuckDB (two passes)
   cohort.py              six strata, index date, eligibility, attrition
   labels.py              six heads + masks (incident conditions, MACE with blanking, ...)
   features/repro.py      stream 4 (15 women-specific features, with provenance)
@@ -41,11 +41,11 @@ Cardio AI MCP contract and are required (`imaging_required: true`).
    tables or folders MCP gives you. `build_study` refuses to run until imaging is wired.
 3. **Feasibility** (aggregate only):
    ```python
-   from mcp_adapter.backend import SparkBackend
+   from mcp_adapter.backend import make_backend
    from mcp_adapter.config import StudyConfig
    from mcp_adapter.pipeline import run_feasibility, build_study, build_pretraining_pool
    cfg = StudyConfig.load("config/study.yaml")
-   be = SparkBackend(spark)            # the session the MCP notebook provides
+   be = make_backend(cfg)              # BigQuery (MCP warehouse); helper tables go to cardioai_work
    run_feasibility(be, cfg)            # -> reports/01_feasibility_counts.csv (suppressed)
    ```
    Check the feasibility gates in protocol §6 before going further.
