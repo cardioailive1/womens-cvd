@@ -62,7 +62,9 @@ def check_imaging_config(cfg: StudyConfig) -> None:
         if src.kind == "none" or not src.manifest:
             raise ValueError(
                 f"{name} is not configured but imaging_required is true. Set platform.{name}.kind "
-                f"and .manifest in config/study.yaml to the MCP table or files (protocol section 10).")
+                f"and .manifest in config/study.yaml to the MCP table or files (protocol section 10). "
+                f"Before the images are delivered, build the first pass with cfg.imaging_required = False "
+                f"to get the cohort and pool for the de-identification request (RUNBOOK Step 2).")
 
 
 def _imaging_selection(be, cfg, people_idx: pd.DataFrame):

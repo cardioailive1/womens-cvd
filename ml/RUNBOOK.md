@@ -151,13 +151,21 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
    - for women with a cardiac evaluation, grouped into studies;
    - dated from `FACT_RADIOLOGY.RADIOLOGY_DTM` through the accession number and kept when within −30 to +2 days of an evaluation. Echo studies with no radiology report have no date there; they are kept, since an echo is itself a cardiac evaluation, and dated from the DICOM header once delivered (set `keep_undated: false` to drop them).
 
-   MCP gives access to the images only after this request, so it is the first thing run in the workspace. Limit it to the women the study will use (the cohort plus the pre-training pool) rather than every woman with a cardiac evaluation, so MCP de-identifies only what is needed. In a notebook, after Steps 3–5 have built the cohort and pool tables:
+   **Order.** MCP gives access to the images only after this request, and the request lists the studies of the women the study will use. So the cohort and pre-training pool are built first, in a pass without imaging; the request follows; the images arrive; then the study is rebuilt with them (Step 4). Nothing about who is in the cohort, or which split she is in, depends on the images: index dates come from coded cardiac evaluations, and the split is locked in the work dataset on the first pass and reused on the rebuild.
+
+   In a notebook (after the feasibility gates in Step 3 pass):
 
    ```python
    import pandas as pd
+   from mcp_adapter.pipeline import build_study, build_pretraining_pool
    from mcp_adapter.imaging_sources import build_dicom_request
+
+   cfg.imaging_required = False                    # pass 1: no images yet (they come after this request)
+   t = build_study(be, cfg, f"{WB}/hcman_pass1")   # cohort, labels, locked split
+   pool = build_pretraining_pool(be, cfg, t["cohort"], f"{WB}/hcman_pass1_pool")
    women = pd.concat([t["cohort"].person_id, pool["pool"].person_id]).unique()
    req = build_dicom_request(be, cfg, f"{WB}/imaging/dicom_request.csv", include_person_ids=women)
+   cfg.imaging_required = True                     # back on: Step 4 runs once the images are wired
    ```
 
    or from the command line, with a CSV holding a `person_id` column:
