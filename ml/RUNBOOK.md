@@ -87,6 +87,13 @@ Everyone who audits needs a workspace account and DUA, and is listed by user nam
 - **Echo LVEF:** choose the result types in `DIM_ECHO_TEST_RESULT_TYPE` by `ECHO_TEST_RESULT_NAME` / `ECHO_TEST_RESULT_DESCRIPTION`; the value is `FACT_ECHO_RESULTS.ECHO_RESULT_VALUE`. The `reports.echo_lvef` source shows these values to reviewers and the automatic audit as "LVEF nn%"; it stays off until its join key and date column are known.
 - **Still with Tommy Stretch (ECG):** whether each lead and acquisition has exactly one Rhythm row, and which `FACT_ECG` column holds the confirmed (over-read) interpretation.
 
+**From MCP's Radiology deck (2 Nov 2026):**
+- **The de-identification request** is a CSV of `STUDY_INSTANCE_UID`, `PATIENT_DK`, `MODALITY` and `STMO_NAME_IN_ADL` for the selected studies, given to the TSM. Image access comes only after it is processed.
+- **The inventory** (`FACT_RADIOLOGY_DICOM_INVENTORY`) has one row per DICOM instance. `IMAGE_DEID_STATUS` Ready or Available can be submitted. The deck's column list shows no `PATIENT_DK` (see Step 2).
+- **`FACT_IMAGINGSTUDY`** is curated, study-level data from the radiology information system and "the most accurate place to find a specific type of imaging study". It has `PROCEDURE_CODE_TEXT`, `STUDY_DESCRIPTION`, `MODALITY_1..n` and instance and series counts. It joins to the inventory on `STMO_NAME_IN_ADL` + `STUDY_INSTANCE_UID`.
+- **`FACT_RADIOLOGY_DICOM_HEADER_STORAGE`** holds the full DICOM header per instance as JSON (`HEADER_TAG`). It joins on STMO, modality and the study, series and instance UIDs. It can be read before requesting, so tags such as StudyDate, SeriesDescription and NumberOfFrames can be checked on the inventory side. Whether they survive de-identification is still a question for the TSM.
+- **Dates:** `RADIOLOGY_DTM` is when the imaging was performed and `RADIOLOGY_REVIEW_DTM` when it was reviewed; the code uses the former. Reports link to images through `ACCESSION_NBR` = `DICOM_ACCESSION_NUMBER`. DICOM inventory data is not in OMOP.
+
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
 
 In this runbook, `$WB` stands for your workspace's persistent folder (for example `/workbench`). Replace it with the real path.
@@ -144,9 +151,23 @@ Goal: `config/study.yaml` names the real OMOP schemas and imaging sources, and a
    - for women with a cardiac evaluation, grouped into studies;
    - dated from `FACT_RADIOLOGY.RADIOLOGY_DTM` through the accession number and kept when within −30 to +2 days of an evaluation. Echo studies with no radiology report have no date there; they are kept, since an echo is itself a cardiac evaluation, and dated from the DICOM header once delivered (set `keep_undated: false` to drop them).
 
-   ```bash
-   python -m mcp_adapter.imaging_sources request --config config/study.yaml --out $WB/imaging/dicom_request.csv
+   MCP gives access to the images only after this request, so it is the first thing run in the workspace. Limit it to the women the study will use (the cohort plus the pre-training pool) rather than every woman with a cardiac evaluation, so MCP de-identifies only what is needed. In a notebook, after Steps 3–5 have built the cohort and pool tables:
+
+   ```python
+   import pandas as pd
+   from mcp_adapter.imaging_sources import build_dicom_request
+   women = pd.concat([t["cohort"].person_id, pool["pool"].person_id]).unique()
+   req = build_dicom_request(be, cfg, f"{WB}/imaging/dicom_request.csv", include_person_ids=women)
    ```
+
+   or from the command line, with a CSV holding a `person_id` column:
+
+   ```bash
+   python -m mcp_adapter.imaging_sources request --config config/study.yaml \
+       --out $WB/imaging/dicom_request.csv --women $WB/imaging/request_women.csv
+   ```
+
+   **PATIENT_DK.** MCP's Radiology deck (2 Nov 2026) lists no `PATIENT_DK` in the inventory. With `patient_dk_source: auto` the code uses the inventory's column if it has one, otherwise `DIM_PATIENT` through `PATIENT_CLINIC_NUMBER` (current rows, `PATIENT_MERGED_FLAG = 'N'`). If a woman has more than one current `PATIENT_DK`, the lowest is used, and report 00 counts how many women this affects; ask the TSM which one they want. Studies with no `PATIENT_DK` are left out of the submission and counted.
 
    This writes two files. `dicom_request.csv` is the working list the manifest step uses later. `dicom_request_deid_submission.csv` is what MCP asked for: exactly `STUDY_INSTANCE_UID`, `PATIENT_DK`, `MODALITY` and `STMO_NAME_IN_ADL`, one row per study, modality and storage segment. Check `reports/00_dicom_request.csv` for the number of studies (and how many are dated), women and instances, then give the submission CSV to the MCP Technical Success Manager, who submits the studies for de-identification. It holds patient keys, so hand it over the way the TSM specifies (for example, left in the workspace), not by email. When the files are delivered, link each one back to its woman and date:
 
