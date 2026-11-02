@@ -26,6 +26,9 @@ platform:
     table: mcp.FACT_RADIOLOGY_DICOM_INVENTORY   # echo is listed here as MODALITY 'US' (MCP, 28 Oct)
     patient_column: PATIENT_CLINIC_NUMBER   # Mayo clinic number, mapped to OMOP via person_map below
     patient_dk_column: PATIENT_DK           # required in the de-identification submission CSV
+    # The Radiology deck (2 Nov 2026) lists no PATIENT_DK in the inventory: auto uses the inventory
+    # column when present, otherwise DIM_PATIENT via PATIENT_CLINIC_NUMBER (PATIENT_MERGED_FLAG = 'N').
+    patient_dk_source: auto                 # auto | inventory | dim_patient
     study_uid_column: STUDY_INSTANCE_UID
     series_uid_column: SERIES_INSTANCE_UID
     accession_column: DICOM_ACCESSION_NUMBER   # = FACT_RADIOLOGY.ACCESSION_NBR

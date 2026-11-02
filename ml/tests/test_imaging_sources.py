@@ -188,3 +188,44 @@ def test_extract_mayo_fact_ecg_waveform(db, tmp_path):
     assert "ECGs skipped: several records per lead, none the full 10 s" in rep.index
     v = np.array([-3, 0, 32767, -32768], dtype="<i2")
     assert (decode_waveform(enc(v)) == v).all()                                # URL + Base64 round trip
+
+
+def test_submission_takes_patient_dk_from_dim_patient(db, tmp_path):
+    """Radiology deck (2 Nov 2026): the inventory may carry no PATIENT_DK. Then it comes from
+    DIM_PATIENT through the clinic number, current rows only; the CSV keeps MCP's four columns."""
+    people = db.execute("""SELECT p.person_id, MIN(po.procedure_date) AS d FROM omop_cdm.procedure_occurrence po
+                           JOIN omop_cdm.person p USING (person_id) WHERE p.gender_concept_id = 8532
+                           GROUP BY p.person_id ORDER BY p.person_id LIMIT 6""").df()
+    inv, dims = [], []
+    for r in people.itertuples():
+        mc = f"MC{r.person_id:07d}"
+        for k in range(2):
+            inv.append((mc, f"S.{r.person_id}", f"S.{r.person_id}.s0", f"S.{r.person_id}.i{k}", "US", "CARDIO",
+                        "TTE ECHO COMPLETE", "Ready"))
+        dims.append((900000 + r.person_id, mc, "N"))
+        dims.append((800000 + r.person_id, mc, "Y"))          # an old merged-away row: not used
+    dims.append((700000 + int(people.person_id.iloc[0]), f"MC{int(people.person_id.iloc[0]):07d}", "N"))  # 2nd system
+    db.execute("CREATE SCHEMA IF NOT EXISTS mcp")
+    db.register("inv2", pd.DataFrame(inv, columns=["PATIENT_CLINIC_NUMBER", "STUDY_INSTANCE_UID", "SERIES_INSTANCE_UID",
+                                                   "SOP_INSTANCE_UID", "MODALITY", "STMO_NAME_IN_ADL",
+                                                   "STUDY_DESCRIPTION", "IMAGE_DEID_STATUS"]))
+    db.execute("CREATE OR REPLACE TABLE inv_nodk AS SELECT * FROM inv2")
+    db.register("dim2", pd.DataFrame(dims, columns=["PATIENT_DK", "PATIENT_CLINIC_NUMBER", "PATIENT_MERGED_FLAG"]))
+    db.execute("CREATE OR REPLACE TABLE dim_pat2 AS SELECT * FROM dim2")
+    cfg = cfg_for(tmp_path)
+    assert cfg.dicom_inventory["patient_dk_source"] == "auto"
+    cfg.dicom_inventory.update(table="inv_nodk", date_source="none", accession_column=None)
+    cfg.dim_patient.update(table="dim_pat2")
+    keep = people.person_id.tolist()[:4]
+    req = build_dicom_request(DuckDBBackend(db), cfg, tmp_path / "r.csv", include_person_ids=keep)
+    assert set(req.person_id) == set(keep) and "clinic_number" not in req
+    sub = pd.read_csv(tmp_path / "r_deid_submission.csv")
+    assert list(sub.columns) == ["STUDY_INSTANCE_UID", "PATIENT_DK", "MODALITY", "STMO_NAME_IN_ADL"]
+    assert len(sub) == 4 and not sub.PATIENT_DK.isna().any()
+    first = int(people.person_id.iloc[0])
+    assert set(sub.PATIENT_DK) == {700000 + first} | {900000 + p for p in keep[1:]}   # lowest current DK
+    rep = pd.read_csv(tmp_path / "rep" / "00_dicom_request.csv").set_index("item")
+    assert "PATIENT_DK taken from: dim_patient" in rep.index
+    cfg.dicom_inventory["patient_dk_source"] = "bogus"
+    with pytest.raises(ValueError, match="patient_dk_source"):
+        build_dicom_request(DuckDBBackend(db), cfg, tmp_path / "r2.csv")

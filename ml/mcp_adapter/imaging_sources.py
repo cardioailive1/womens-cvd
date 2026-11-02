@@ -53,7 +53,8 @@ SUBMISSION_COLUMNS = ["STUDY_INSTANCE_UID", "PATIENT_DK", "MODALITY", "STMO_NAME
 
 
 def build_dicom_request(be: Backend, cfg: StudyConfig, out_csv: str | Path,
-                        exclude_person_ids=None, submission_csv: str | Path | None = None) -> pd.DataFrame:
+                        exclude_person_ids=None, submission_csv: str | Path | None = None,
+                        include_person_ids=None) -> pd.DataFrame:
     """Study-level request list from FACT_RADIOLOGY_DICOM_INVENTORY (one row per DICOM instance).
 
     Keeps instances that can be de-identified, of the configured modality and study description,
@@ -65,11 +66,20 @@ def build_dicom_request(be: Backend, cfg: StudyConfig, out_csv: str | Path,
     Writes two files: the working list (`out_csv`, with person_id, dates and counts, for the
     manifest step) and the de-identification submission MCP asks for (`submission_csv`, default
     `<out_csv stem>_deid_submission.csv`): exactly STUDY_INSTANCE_UID, PATIENT_DK, MODALITY,
-    STMO_NAME_IN_ADL, one row per study / modality / STMO. Plus a suppressed count report."""
+    STMO_NAME_IN_ADL, one row per study / modality / STMO. Plus a suppressed count report.
+
+    PATIENT_DK: taken from the inventory when it has the column, else from DIM_PATIENT through
+    PATIENT_CLINIC_NUMBER (current row, PATIENT_MERGED_FLAG = 'N'); `patient_dk_source` = auto |
+    inventory | dim_patient. MCP's Radiology deck lists no PATIENT_DK in the inventory, and the OMOP
+    guide says PATIENT_DK is deprecated in some tables. `include_person_ids` limits the request to
+    those women (e.g. the cohort plus the pre-training pool)."""
     inv = cfg.dicom_inventory
-    _require("dicom_inventory", inv, ("table", "patient_column", "study_uid_column", "patient_dk_column",
+    _require("dicom_inventory", inv, ("table", "patient_column", "study_uid_column",
                                       "modality_column", "stmo_column"))
+    dk_source = _patient_dk_source(be, inv)
     evals = Q.cardiac_eval_events(be, cfg)[["person_id", "event_date"]].drop_duplicates()
+    if include_person_ids is not None:
+        evals = evals[evals.person_id.isin(set(include_person_ids))]
     if exclude_person_ids is not None:
         evals = evals[~evals.person_id.isin(set(exclude_person_ids))]
     be.register(pd.DataFrame({"person_id": evals.person_id.unique()}), "hcman_eval_people")
@@ -85,7 +95,9 @@ def build_dicom_request(be: Backend, cfg: StudyConfig, out_csv: str | Path,
         cond.append(regex_match(cfg.dialect, col, inv["description_pattern"]))
         if inv.get("description_exclude"):       # e.g. fetal echo, TEE: not the TTE views the model reads
             cond.append(f"NOT {regex_match(cfg.dialect, f'COALESCE({col}, {chr(39)}{chr(39)})', inv['description_exclude'])}")
-    keys = {"modality": inv["modality_column"], "stmo": inv["stmo_column"], "patient_dk": inv["patient_dk_column"]}
+    keys = {"modality": inv["modality_column"], "stmo": inv["stmo_column"], "clinic_number": inv["patient_column"]}
+    if dk_source == "inventory":
+        keys["patient_dk"] = inv["patient_dk_column"]
     opt = {k: inv.get(f"{k}_column") for k in ("accession", "description")}
     sel = "".join(f", i.{c} AS {k}" for k, c in keys.items())
     sel += "".join(f", MAX(i.{c}) AS {k}" for k, c in opt.items() if c)
@@ -110,6 +122,9 @@ GROUP BY a.study_uid""")
         studies = studies.merge(dates, on="study_uid", how="left")
     if "study_date" not in studies:
         studies["study_date"] = pd.NaT
+    dk_notes = {}
+    if dk_source == "dim_patient":
+        studies, dk_notes = _dk_from_dim_patient(be, cfg, studies)
 
     studies["study_date"] = pd.to_datetime(studies.study_date)
     lo, hi = inv.get("window_days", [-30, 2])
@@ -122,8 +137,10 @@ GROUP BY a.study_uid""")
 
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
-    sub = (df.rename(columns={"study_uid": "STUDY_INSTANCE_UID", "patient_dk": "PATIENT_DK",
-                              "modality": "MODALITY", "stmo": "STMO_NAME_IN_ADL"})[SUBMISSION_COLUMNS]
+    df = df.drop(columns="clinic_number")         # the working list keys women by person_id only
+    no_dk = df.patient_dk.isna()
+    sub = (df[~no_dk].rename(columns={"study_uid": "STUDY_INSTANCE_UID", "patient_dk": "PATIENT_DK",
+                                      "modality": "MODALITY", "stmo": "STMO_NAME_IN_ADL"})[SUBMISSION_COLUMNS]
              .drop_duplicates().sort_values(SUBMISSION_COLUMNS))
     submission_csv = Path(submission_csv or Path(out_csv).with_name(Path(out_csv).stem + "_deid_submission.csv"))
     sub.to_csv(submission_csv, index=False)
@@ -131,11 +148,47 @@ GROUP BY a.study_uid""")
     rep = pd.DataFrame([{"item": "studies", "n": df.study_uid.nunique()},
                         {"item": "studies with a date", "n": int(df.dated.sum())},
                         {"item": "women", "n": df.person_id.nunique()},
-                        {"item": "instances", "n": int(df.n_instances.sum())}])
+                        {"item": "instances", "n": int(df.n_instances.sum())},
+                        {"item": f"PATIENT_DK taken from: {dk_source}", "n": len(sub)},
+                        {"item": "studies left out of the submission: no PATIENT_DK", "n": int(no_dk.sum())},
+                        *({"item": k, "n": v} for k, v in dk_notes.items())])
     write_report(suppress(rep, ["n"], cfg.min_cell_size), "00_dicom_request", cfg.report_dir)
     log.info("request list: %d studies (%d dated) for %d women -> %s",
              len(df), int(df.dated.sum()), df.person_id.nunique(), out_csv)
     return df
+
+
+def _patient_dk_source(be: Backend, inv: dict) -> str:
+    """auto: the inventory's own PATIENT_DK column if it exists, else DIM_PATIENT."""
+    src = inv.get("patient_dk_source", "auto")
+    if src != "auto":
+        if src not in ("inventory", "dim_patient"):
+            raise ValueError(f"dicom_inventory.patient_dk_source must be auto, inventory or dim_patient, not {src!r}")
+        return src
+    col = inv.get("patient_dk_column")
+    if not col:
+        return "dim_patient"
+    cols = {c.upper() for c in be.sql(f"SELECT * FROM {inv['table']} LIMIT 0").columns}
+    return "inventory" if col.upper() in cols else "dim_patient"
+
+
+def _dk_from_dim_patient(be: Backend, cfg: StudyConfig, studies: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """PATIENT_DK for each study's clinic number from DIM_PATIENT, current rows only. A clinic
+    number with several current PATIENT_DKs (one per record system) takes the lowest; the count
+    goes in the report so the TSM can say which they want."""
+    dim = cfg.dim_patient
+    _require("dim_patient", dim, ("table", "dk_column", "clinic_number_column"))
+    be.register(pd.DataFrame({"clinic_number": studies.clinic_number.astype(str).unique()}), "hcman_req_mc")
+    flag = (f" AND d.{dim['merged_flag_column']} = '{dim.get('merged_flag_current', 'N')}'"
+            if dim.get("merged_flag_column") else "")
+    dk = be.sql(f"""
+SELECT m.clinic_number, d.{dim['dk_column']} AS patient_dk
+FROM hcman_req_mc m JOIN {dim['table']} d
+  ON CAST(d.{dim['clinic_number_column']} AS STRING) = m.clinic_number{flag}""")
+    several = int((dk.groupby("clinic_number").patient_dk.nunique() > 1).sum())
+    first = dk.sort_values("patient_dk").drop_duplicates("clinic_number")
+    out = studies.assign(clinic_number=studies.clinic_number.astype(str)).merge(first, on="clinic_number", how="left")
+    return out, {"women with several current PATIENT_DKs (lowest used)": several}
 
 
 # ------------------------------------------------------------------ ECG waveforms from a table
@@ -301,6 +354,8 @@ def main(argv=None):
     ap.add_argument("--files", help="manifest: folder the requested DICOMs were delivered to")
     ap.add_argument("--request", help="manifest: the request list CSV made by `request`")
     ap.add_argument("--modality", default="US", help="manifest: keep only this DICOM modality ('' = all)")
+    ap.add_argument("--women", help="request: CSV with a person_id column; limit the request to these "
+                                    "women (e.g. the cohort plus the pre-training pool)")
     ap.add_argument("--submission", help="request: path of the CSV for the TSM "
                                          "(default <out stem>_deid_submission.csv)")
     a = ap.parse_args(argv)
@@ -312,7 +367,8 @@ def main(argv=None):
     cfg = StudyConfig.load(a.config)
     be = make_backend(cfg)
     if a.cmd == "request":
-        build_dicom_request(be, cfg, a.out, submission_csv=a.submission)
+        women = pd.read_csv(a.women).person_id if a.women else None
+        build_dicom_request(be, cfg, a.out, submission_csv=a.submission, include_person_ids=women)
     else:
         extract_ecg_table(be, cfg, a.out)
 
