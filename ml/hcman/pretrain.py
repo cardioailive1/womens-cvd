@@ -1,19 +1,20 @@
 """Phase 1 pre-training from scratch, inside MCP (first-time training: no prior weights exist).
 
     python -m hcman.pretrain --config config/study.yaml --pool-dir /workbench/hcman_pool \
-        --out /workbench/hcman_pretrain [--size full|small] [--stages ecg,echo,ehr,labs]
+        --out /workbench/hcman_pretrain [--size full|small] [--stages ecg,echo,labs]
 
 The pool comes from mcp_adapter.pipeline.build_pretraining_pool: women with cardiac evaluations,
 EXCLUDING the cohort's validation and test women. No labels are used.
 
-  ECG   SimCLR (NT-Xent) on 12-lead waveforms — shift, amplitude, noise, lead dropout, baseline wander
+  ECG   SimCLR (NT-Xent) on 12-lead waveforms with the MobileNet1D encoder — shift, amplitude,
+        noise, lead dropout, baseline wander
   Echo  SimCLR on single echo frames — random resized crop, brightness/contrast, noise
-  EHR   masked-token modelling, 15% of tokens (as in the form)
   Labs  masked-step prediction — 15% of lab events have their value hidden and predicted
+  (EHR is a tabular model fitted during fine-tuning, hcman.ehr_model: nothing to pre-train.)
 
-Outputs `encoders.pt` (keys prefixed ecg./echo./ehr./labs. to load into HCMAN with
-`--init-weights`) and `preprocessors.pkl` (EHR vocabulary, lab bins and z-scores fit on the
-pool), which fine-tuning must reuse via `--preprocessors` so token ids line up.
+Outputs `encoders.pt` (keys prefixed ecg./echo./labs. to load into HCMAN with `--init-weights`)
+and `preprocessors.pkl` (lab z-scores fit on the pool), which fine-tuning reuses via
+`--preprocessors`.
 """
 from __future__ import annotations
 
@@ -31,12 +32,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from mcp_adapter.config import StudyConfig
-from mcp_adapter.features.labs_ehr import EHRTokenizer, LabEncoder
+from mcp_adapter.features.labs_ehr import LabEncoder
 from mcp_adapter.features.waveforms import load_echo, load_ecg
 from mcp_adapter.privacy import write_report
 
 from .data import Preprocessors
-from .model import CardioTransformer, ECGTransformer, EchoEncoder, HCMANConfig, TemporalTransformer
+from .model import EchoEncoder, HCMANConfig, MobileNet1D, TemporalTransformer
 
 log = logging.getLogger("hcman.pretrain")
 
@@ -166,7 +167,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True); ap.add_argument("--pool-dir", required=True)
     ap.add_argument("--out", required=True); ap.add_argument("--size", choices=["full", "small"])
-    ap.add_argument("--stages", default="ecg,echo,ehr,labs"); ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--stages", default="ecg,echo,labs"); ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--epochs", type=int, help="override every stage's epochs (smoke tests)")
     ap.add_argument("--resume", action="store_true",
                     help="continue an interrupted run in the same --out folder: finished stages are "
@@ -184,11 +185,11 @@ def main(argv=None):
     if a.resume and (out / "preprocessors.pkl").exists():
         pre = Preprocessors.load(out / "preprocessors.pkl")
     else:
-        pre = Preprocessors(ehr=EHRTokenizer(lookback_days=cfg.lookback_days).fit(t["ehr_tokens"], t["measurements"], ids),
-                            labs=LabEncoder(window_days=cfg.labs_window_days).fit(t["measurements"], ids), sites=[])
+        pre = Preprocessors(ehr=None, labs=LabEncoder(window_days=cfg.labs_window_days).fit(t["measurements"], ids),
+                            sites=[])
         pre.save(out / "preprocessors.pkl")
     size = a.size or cfg.model_size
-    mc = (HCMANConfig.small if size == "small" else HCMANConfig)(ehr_vocab=pre.ehr.vocab_size)
+    mc = (HCMANConfig.small if size == "small" else HCMANConfig)()
     bs = P["batch_size"]; ep = lambda k: a.epochs if a.epochs is not None else P[k]
     kw = dict(num_workers=a.workers, drop_last=False)
     stages = set(a.stages.split(","))
@@ -216,7 +217,7 @@ def main(argv=None):
             f.unlink()
 
     if "ecg" in stages and len(t["ecg_records"]) and not done("ecg"):
-        enc, head = ECGTransformer(mc).to(dev), proj(mc.ecg_dim).to(dev)
+        enc, head = MobileNet1D(mc).to(dev), proj(mc.ecg_dim).to(dev)
         dl = DataLoader(ECGSet(t["ecg_records"], cfg.ecg_source.kind), batch_size=bs, shuffle=True, collate_fn=ok_collate, **kw)
         def step(x):
             if len(x) < 2: return None
@@ -239,23 +240,8 @@ def main(argv=None):
                  ckpt=ckdir / "epochs_echo.pt")
         finish("echo", {f"echo.{k}": v for k, v in enc.state_dict().items() if k.startswith(("backbone", "fc"))}, h)
 
-    if "ehr" in stages and not done("ehr"):
-        enc = CardioTransformer(mc).to(dev)
-        seqs = list(pre.ehr.transform(t["ehr_tokens"], t["measurements"], ids).values())
-        dl = DataLoader(SeqSet(seqs), batch_size=bs, shuffle=True, collate_fn=partial(pad_collate, width=4), **kw)
-        mask_id = pre.ehr.vocab["[MASK]"]
-        def step(batch):
-            x, m = (v.to(dev) for v in batch)
-            cand = m.clone(); cand[:, 0] = False                       # never mask CLS
-            sel = cand & (torch.rand_like(x[..., 0]) < 0.15)
-            if not sel.any(): return None
-            target = x[..., 0].long()[sel]
-            xm = x.clone(); xm[..., 0] = torch.where(sel, torch.full_like(x[..., 0], mask_id), x[..., 0])
-            xm[..., 2] = torch.where(sel, torch.zeros_like(x[..., 2]), x[..., 2])
-            return F.cross_entropy(enc.mlm(enc(xm, m))[sel], target)
-        h = _fit(list(enc.parameters()), dl, step, ep("ehr_epochs"), 1e-4, dev, "ehr", modules=(enc,),
-                 ckpt=ckdir / "epochs_ehr.pt")
-        finish("ehr", {f"ehr.{k}": v for k, v in enc.state_dict().items()}, h)
+    if "ehr" in stages:
+        log.info("ehr: the EHR stream is a tabular model fitted during fine-tuning; nothing to pre-train")
 
     if "labs" in stages and not done("labs"):
         enc = TemporalTransformer(mc).to(dev)

@@ -4,8 +4,10 @@
 
 The bundle is what hcman.export writes plus preprocessors.pkl and thresholds.json from the
 training run. POST /predict takes the JSON built by the app's hcmanAdapter.ts and returns
-HcmanPrediction. The app has no ECG waveforms, echo cine or ICD/ATC history yet, so those
-streams are sent as missing; the response lists them in `missingModalities`.
+HcmanPrediction. The app has no ECG waveforms or echo cine yet, so those streams are sent as
+missing. Diagnosis and drug codes are optional: `codes: [{"type": "DX"|"RX", "code": "I10",
+"daysBeforeIndex": 30}]` feeds the tabular EHR model; without them the EHR stream is missing too.
+The response lists missing streams in `missingModalities`.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from mcp_adapter.features.repro import FEATURE_NAMES, MENO_STATUS, PREG_STATUS
 from mcp_adapter.features.waveforms import ECHO_VIEWS, N_SAMPLES
 
 from .data import Preprocessors
+from .ehr_model import featurize
 from .export import pad_to
 
 LOINC_TO_ITEM = {code: item for item, spec in C.LABS.items() for code in spec["loinc"]}
@@ -79,21 +82,23 @@ class Predictor:
 
     def predict(self, req: dict) -> dict:
         meas = self._measurements(req.get("observations", []))
-        empty_tokens = pd.DataFrame(columns=["person_id", "ttype", "code", "rel_day"])
-        ehr = self.pre.ehr.transform(empty_tokens, meas, [0])[0]
+        codes = req.get("codes") or []
+        tokens = pd.DataFrame([{"person_id": 0, "ttype": c.get("type"), "code": c.get("code"),
+                                "rel_day": -int(c.get("daysBeforeIndex", 0))} for c in codes],
+                              columns=["person_id", "ttype", "code", "rel_day"])
+        X = self.pre.ehr.matrix(featurize(tokens, [0], self.contract.get("lookback_days", 365)), [0])
+        ehr_scores, ehr_present = self.pre.ehr.scores(X).astype(np.float32), self.pre.ehr.present(X)
         labs = self.pre.labs.transform(meas, [0])[0]
         if len(labs) == 0:
             labs_arr, labs_mask = np.zeros((1, 1, 3), np.float32), np.zeros((1, 1), bool)
         else:
             labs_arr, labs_mask = labs[None].astype(np.float32), np.ones((1, len(labs)), bool)
         labs_arr, labs_mask = pad_to(labs_arr, labs_mask, self.contract["labs_len"])
-        ehr_arr, ehr_mask = pad_to(ehr[None].astype(np.float32), np.ones((1, len(ehr)), bool),
-                                   self.contract["ehr_len"])
         N = len(ECHO_VIEWS) * self.T
         feeds = {
             "ecg": np.zeros((1, 12, N_SAMPLES), np.float32), "ecg_present": np.zeros(1, bool),
             "echo": np.zeros((1, N, 3, 224, 224), np.float32), "echo_mask": np.zeros((1, N), bool),
-            "ehr": ehr_arr, "ehr_mask": ehr_mask,
+            "ehr_scores": ehr_scores, "ehr_present": ehr_present,
             "labs": labs_arr, "labs_mask": labs_mask,
             "repro": encode_repro(req.get("repro", {}), req.get("age"))[None],
         }
@@ -105,7 +110,8 @@ class Predictor:
             "mace12m": float(mace[0]), "postpartumCvd": float(pp[0]) if postpartum else None,
             "riskTier": [float(x) for x in tier[0]], "atypicalPresentation": float(atyp[0]),
             "fmdScreeningTrigger": float(fmd[0]), "thresholds": self.thresholds,
-            "missingModalities": ["ECG waveform", "echocardiogram", "diagnosis/medication history"],
+            "missingModalities": ["ECG waveform", "echocardiogram"]
+                                 + ([] if ehr_present[0] else ["diagnosis/medication history"]),
         }
 
 

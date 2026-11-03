@@ -73,19 +73,27 @@ platform:
   # interpretation): PATIENT_DK via DIM_PATIENT, ACQUISITION_TS = ECG_DTM.
   # `python -m mcp_adapter.imaging_sources ecg` converts them to files + a manifest.
   ecg_table:
+    # MCP ECG deck (3 Nov 2026): FACT_ECG_WAVEFORM is keyed by PATIENT_CLINIC_NUMBER + ACQUISITION_TS;
+    # WAVEFORM_TYPE 'rhythm' is the full 10 s strip and EKG_TYPE 'resting' the diagnostic ECG.
     table: mcp.FACT_ECG_WAVEFORM
     format: mayo_waveform            # mayo_waveform | muse_xml | lead_base64
-    person_column: PATIENT_DK        # joined to DIM_PATIENT, then to OMOP through person_map
-    date_column: ACQUISITION_TS      # one acquisition = PATIENT_DK + ACQUISITION_TS
+    person_column: PATIENT_CLINIC_NUMBER
+    person_key: clinic_number        # clinic_number (ECG deck) | patient_dk (through DIM_PATIENT)
+    date_column: ACQUISITION_TS      # bedside recording time (= FACT_ECG.ECG_DTM)
     waveform_column: WAVEFORM
     lead_column: LEAD_ID
     type_column: WAVEFORM_TYPE
-    rhythm_value: Rhythm
+    rhythm_value: rhythm             # compared case-insensitively
+    ekg_type_column: EKG_TYPE
+    ekg_type_value: resting
     url_encoded: true
     units_per_bit: 4.88              # counts -> microvolts
-    sample_rate_table: mcp.FACT_ECG_WAVEFORM_RESTING_MEASUREMENT
-    sample_rate_column: ECGSAMPLEBASE
-    sample_rate_keys: [PATIENT_DK, ACQUISITION_TS]   # TODO(MCP, Tommy Stretch): confirm the join keys
+    # Sampling rate: the deck confirms 2,500 rhythm samples per lead = 250 Hz and 5,000 = 500 Hz, which
+    # the code infers from the record length. To read ECGSAMPLEBASE instead, set the table and its
+    # join keys (not stated by MCP) here.
+    sample_rate_table: null          # e.g. mcp.FACT_ECG_WAVEFORM_RESTING_MEASUREMENT
+    sample_rate_column: null         # e.g. ECGSAMPLEBASE
+    sample_rate_keys: null
   ecg_source:
     kind: npy_dir                # the .npz files written by `imaging_sources ecg`
     path: null                   # set to the extraction output folder (e.g. $WB/ecg_npz)
@@ -256,6 +264,14 @@ model:
   condition_head: multilabel     # multilabel (sigmoid, recommended) | softmax (as in the form)
   size: full                     # full (form spec) | small (smoke tests)
   freeze_imaging_backbones_epochs: 5
+  # Stream 1 is a MobileNet1D ECG encoder (hcman.model; ~1.0M parameters). Stream 3 is a tabular
+  # EHR model on diagnosis categories (ICD-10-CM, 3 characters) and drug classes (ATC level 4) from
+  # the lookback year; its per-target scores are HCMAN's EHR input. MCP approved exporting both.
+  ehr_model:
+    kind: logistic                 # logistic (L2, class-balanced) | xgboost
+    C: 1.0                         # logistic: inverse regularisation strength
+    min_count: 11                  # a code group is a feature only if >= 11 training women have it
+    n_folds: 5                     # out-of-fold scores for training women
 
 pretraining:
   # First-time training: there are no prior weights or Phase 1 data, so every encoder is

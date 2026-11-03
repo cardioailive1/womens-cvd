@@ -255,7 +255,9 @@ def _extract_mayo_waveform(be: Backend, cfg: StudyConfig, out_dir, person_ids, b
     src, dim = cfg.ecg_table, cfg.dim_patient
     _require("ecg_table", src, ("table", "person_column", "date_column", "waveform_column", "lead_column",
                                 "type_column", "rhythm_value"))
-    _require("dim_patient", dim, ("table", "dk_column", "clinic_number_column"))
+    by_clinic = src.get("person_key", "patient_dk") == "clinic_number"   # ECG deck, 3 Nov 2026
+    if not by_clinic:
+        _require("dim_patient", dim, ("table", "dk_column", "clinic_number_column"))
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     if person_ids is None:
         person_ids = Q.cardiac_eval_events(be, cfg).person_id.unique()
@@ -268,6 +270,16 @@ def _extract_mayo_waveform(be: Backend, cfg: StudyConfig, out_dir, person_ids, b
         fs_join = (f"LEFT JOIN (SELECT {', '.join(keys)}, MAX({src['sample_rate_column']}) AS fs "
                    f"FROM {src['sample_rate_table']} GROUP BY {', '.join(keys)}) m ON {on}")
         fs_col = ", m.fs AS fs"
+    if by_clinic:        # FACT_ECG_WAVEFORM carries PATIENT_CLINIC_NUMBER itself
+        patient = person_join(cfg, "p", f"w.{dk}")
+    else:                # legacy: PATIENT_DK through DIM_PATIENT
+        patient = (f"JOIN {dim['table']} d ON d.{dim['dk_column']} = w.{dk} "
+                   + person_join(cfg, "p", f"d.{dim['clinic_number_column']}"))
+    # 'rhythm' in the ECG deck, 'Rhythm' in Adam's note: compare case-insensitively
+    where = f"UPPER(CAST(w.{src['type_column']} AS STRING)) = '{str(src['rhythm_value']).upper()}'"
+    if src.get("ekg_type_column") and src.get("ekg_type_value"):     # resting ECGs only
+        where += (f" AND UPPER(CAST(w.{src['ekg_type_column']} AS STRING)) = "
+                  f"'{str(src['ekg_type_value']).upper()}'")
     rows, failed, ambiguous, seen = [], 0, 0, set()
     for s0 in range(0, len(person_ids), batch_people):
         be.register(pd.DataFrame({"person_id": person_ids[s0:s0 + batch_people]}), "hcman_ecg_people")
@@ -275,11 +287,10 @@ def _extract_mayo_waveform(be: Backend, cfg: StudyConfig, out_dir, person_ids, b
 SELECT w.{dk} AS dk, CAST(w.{ts} AS STRING) AS acq, p.person_id, CAST(w.{ts} AS DATE) AS record_date,
        w.{src['lead_column']} AS lead, w.{src['waveform_column']} AS payload{fs_col}
 FROM {w} w
-JOIN {dim['table']} d ON d.{dim['dk_column']} = w.{dk}
-{person_join(cfg, 'p', f"d.{dim['clinic_number_column']}")}
+{patient}
 JOIN hcman_ecg_people b ON b.person_id = p.person_id
 {fs_join}
-WHERE w.{src['type_column']} = '{src['rhythm_value']}'""")
+WHERE {where}""")
         for (pid, acq), g in df.groupby(["person_id", "acq"]):      # one acquisition per woman and time
             if (pid, acq) in seen:
                 continue                                             # same ECG under a second PATIENT_DK

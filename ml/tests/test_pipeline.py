@@ -123,15 +123,19 @@ def test_attrition_is_monotone(study):
 
 # ------------------------------------------------------------------ leakage
 def test_no_target_codes_in_ehr_inputs(study):
+    """The tabular EHR model's features never include a condition-label code or anything after index,
+    and training women get out-of-fold scores."""
     from hcman.data import StudyData
     data = StudyData(study["tmp"] / "tables", study["cfg"])
-    inv = {v: k for k, v in data.pre.ehr.vocab.items()}
-    for arr in data.ehr.values():
-        for tid in arr[:, 0].astype(int):
-            tok = inv[tid]
-            if tok.startswith("DX:"):
-                assert not any(tok[3:].startswith(p) for p in C.LEAKY_CODE_PREFIXES), tok
-        assert (arr[1:, 3] <= 0).all(), "EHR inputs must come from day <= 0"
+    assert data.pre.ehr is not None and data.pre.ehr.features
+    for k in data.pre.ehr.features:
+        assert k.startswith(("DX:", "RX:"))
+        if k.startswith("DX:"):
+            assert k[3:] not in {p for p in C.LEAKY_CODE_PREFIXES if len(p) == 3}, k
+    tok = study["tables"]["ehr_tokens"]
+    assert (tok.rel_day <= 0).all(), "EHR inputs must come from day <= 0"
+    s = next(iter(data.ehr_scores.values()))
+    assert s.shape == (data.pre.ehr.scores(data.pre.ehr.matrix({}, [0])).shape[1],)
 
 
 def test_history_features_and_incident_labels_are_disjoint(study):
@@ -201,7 +205,7 @@ def test_train_export_serve(study, tmp_path):
     pre_dir = tmp_path / "pretrain"
     summ = pretrain.main(["--config", str(cfg_path), "--pool-dir", str(study["tmp"] / "pool"),
                           "--out", str(pre_dir), "--size", "small", "--epochs", "1", "--workers", "0"])
-    assert summ["stages_done"] == ["ecg", "echo", "ehr", "labs"]
+    assert summ["stages_done"] == ["ecg", "echo", "labs"]   # EHR is a tabular model, fitted in fine-tuning
     # --resume on a finished pre-training run keeps every stage and reproduces the same encoders
     before = torch.load(pre_dir / "encoders.pt")
     summ2 = pretrain.main(["--config", str(cfg_path), "--pool-dir", str(study["tmp"] / "pool"),
@@ -237,7 +241,9 @@ def test_train_export_serve(study, tmp_path):
     mc = HCMANConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in ck["model_config"].items()})
     m = HCMAN(mc); m.load_state_dict(ck["state_dict"])
     bundle = tmp_path / "bundle"
-    export(m, bundle)
+    from hcman.data import Preprocessors as _P
+    export(m, bundle, ehr_model=_P.load(run / "preprocessors.pkl").ehr)
+    assert (bundle / "ehr_model.json").exists()
     for f in ("preprocessors.pkl", "thresholds.json"):
         shutil.copy(run / f, bundle / f)
     pred = Predictor(bundle).predict({
@@ -247,11 +253,18 @@ def test_train_export_serve(study, tmp_path):
     assert set(pred["conditions"]) == set(C.CONDITION_ORDER)
     assert 0 <= pred["mace12m"] <= 1 and len(pred["riskTier"]) == 4
     assert pred["postpartumCvd"] is not None
+    assert "diagnosis/medication history" in pred["missingModalities"]      # no codes sent
+    feats = _P.load(run / "preprocessors.pkl").ehr.features
+    if feats:                                                                 # codes sent -> EHR stream used
+        typ, code = feats[0].split(":")
+        pred2 = Predictor(bundle).predict({"age": 50, "repro": {}, "observations": [],
+                                           "codes": [{"type": typ, "code": code, "daysBeforeIndex": 10}]})
+        assert "diagnosis/medication history" not in pred2["missingModalities"]
 
     # (a) padding is exact: unpadded PyTorch == padded PyTorch; (b) ONNX == PyTorch
     import onnxruntime as ort
     from hcman.data import StudyData, collate
-    from hcman.export import EHR_LEN, INPUTS, LABS_LEN, InferenceWrapper, pad_to
+    from hcman.export import INPUTS, LABS_LEN, InferenceWrapper, pad_to
     from hcman.data import Preprocessors
     ds = StudyData(study["tmp"] / "tables", study["cfg"],
                    pre=Preprocessors.load(run / "preprocessors.pkl")).split("test", echo_frames=mc.echo_frames)
@@ -260,10 +273,8 @@ def test_train_export_serve(study, tmp_path):
     x = [b[k] for k in INPUTS]
     with torch.no_grad():
         ref = w(*x)
-        e, em = pad_to(b["ehr"].numpy(), b["ehr_mask"].numpy(), EHR_LEN)
         l, lm = pad_to(b["labs"].numpy(), b["labs_mask"].numpy(), LABS_LEN)
-        xp = dict(zip(INPUTS, x)); xp.update(ehr=torch.tensor(e), ehr_mask=torch.tensor(em),
-                                             labs=torch.tensor(l), labs_mask=torch.tensor(lm))
+        xp = dict(zip(INPUTS, x)); xp.update(labs=torch.tensor(l), labs_mask=torch.tensor(lm))
         padded = w(*[xp[k] for k in INPUTS])
     for r, pdd in zip(ref, padded):
         assert torch.allclose(r, pdd, atol=1e-5)
@@ -277,7 +288,7 @@ def test_full_size_matches_form(study):
     torch = pytest.importorskip("torch")
     pytest.importorskip("torchvision")
     from hcman.model import HCMAN, HCMANConfig
-    m = HCMAN(HCMANConfig(ehr_vocab=20000))
+    m = HCMAN(HCMANConfig())
     n = sum(p.numel() for p in m.parameters()) / 1e6
     print(f"full HCMAN parameters: {n:.1f}M")
-    assert n > 52, "form's ~52M understates a 12-layer d=768 ECG transformer alone (~85M)"
+    assert 45 < n < 60, "MobileNet1D ECG + tabular EHR: in line with the form's ~52M"

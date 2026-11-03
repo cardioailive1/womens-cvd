@@ -1,7 +1,8 @@
 """Turn the adapter's study tables into model-ready tensors.
 
-All fitted statistics (EHR vocabulary + lab bins, lab z-scores, ELM weights) come from the
-TRAINING split only and are saved with the model so inference applies the same transform.
+All fitted statistics (the tabular EHR model and its feature list, lab z-scores, ELM weights)
+come from the TRAINING split only and are saved with the model so inference applies the same
+transform. Training women get out-of-fold EHR scores (hcman.ehr_model).
 """
 from __future__ import annotations
 
@@ -16,9 +17,11 @@ from torch.utils.data import Dataset
 
 from mcp_adapter import concepts as C
 from mcp_adapter.config import StudyConfig
-from mcp_adapter.features.labs_ehr import EHRTokenizer, LabEncoder
+from mcp_adapter.features.labs_ehr import LabEncoder
 from mcp_adapter.features.repro import FEATURE_NAMES
 from mcp_adapter.features.waveforms import ECHO_VIEWS, N_SAMPLES, load_echo, load_ecg
+
+from .ehr_model import EHRModel, N_SCORES, featurize
 
 COND_Y = [f"y_{c}" for c in C.CONDITION_ORDER]
 
@@ -29,7 +32,7 @@ def _opt_int(v):
 
 @dataclass
 class Preprocessors:
-    ehr: EHRTokenizer
+    ehr: EHRModel | None             # fitted during fine-tuning (None after pre-training)
     labs: LabEncoder
     sites: list[str]
     def save(self, path): Path(path).write_bytes(pickle.dumps(self))
@@ -48,11 +51,11 @@ class StudyData:
         train_ids = self.cohort.loc[self.cohort.split == "train", "person_id"]
         if pre is None:
             pre = Preprocessors(
-                ehr=EHRTokenizer(lookback_days=cfg.lookback_days).fit(t["ehr_tokens"], t["measurements"], train_ids),
+                ehr=None,
                 labs=LabEncoder(window_days=cfg.labs_window_days).fit(t["measurements"], train_ids),
                 sites=sorted(self.cohort.loc[self.cohort.split == "train", "site"].astype(str).unique()))
         self.pre = pre
-        self.ehr = pre.ehr.transform(t["ehr_tokens"], t["measurements"], ids)
+        self.ehr_scores, self.ehr_present = self._ehr(t["ehr_tokens"], ids, train_ids, cfg)
         self.labs = pre.labs.transform(t["measurements"], ids)
         self.ecg = t["ecg_records"].set_index("person_id").path.to_dict() if len(t["ecg_records"]) else {}
         self.echo = {pid: g for pid, g in t["echo_records"].groupby("person_id")} if len(t["echo_records"]) else {}
@@ -60,6 +63,28 @@ class StudyData:
         # fairness groups: Black (8516) vs not; unknown race (0 / missing) is masked
         r = self.cohort.race_concept_id.fillna(0)
         self.cohort["fair_group"] = np.where(r == C.BLACK_RACE_CONCEPT_ID, 1, np.where(r == 0, -1, 0))
+
+    def _ehr(self, tokens, ids, train_ids, cfg):
+        """Scores of the tabular EHR model: out-of-fold for training women, full-fit otherwise."""
+        feats = featurize(tokens, ids, cfg.lookback_days)
+        tr = self.cohort.set_index("person_id").loc[list(train_ids)].reset_index()
+        refit = self.pre.ehr is None
+        if refit:
+            self.pre.ehr = EHRModel(**{k: v for k, v in (cfg.ehr_model or {}).items() if k in
+                                       ("kind", "C", "min_count", "min_class", "n_folds", "xgb")},
+                                    seed=cfg.seed).fit_vocab(feats, tr.person_id)
+        m = self.pre.ehr
+        X_tr = m.matrix(feats, tr.person_id.tolist())
+        S_tr = m.oof_scores(X_tr, tr) if refit else None
+        if refit:
+            m.fit(X_tr, tr)
+        X = m.matrix(feats, ids)
+        S = m.scores(X)
+        present = m.present(X)
+        scores = {int(p): S[i] for i, p in enumerate(ids)}
+        if S_tr is not None:
+            scores.update({int(p): S_tr[i] for i, p in enumerate(tr.person_id)})
+        return scores, {int(p): bool(present[i]) for i, p in enumerate(ids)}
 
     def split(self, name: str, **kw) -> "HCMANDataset":
         return HCMANDataset(self, self.cohort[self.cohort.split == name].reset_index(drop=True), **kw)
@@ -105,7 +130,8 @@ class HCMANDataset(Dataset):
                     pass
         item["echo"], item["echo_mask"] = echo, fmask
 
-        item["ehr"] = self.d.ehr[pid]
+        item["ehr_scores"] = self.d.ehr_scores.get(int(pid), np.zeros(N_SCORES, np.float32))
+        item["ehr_present"] = self.d.ehr_present.get(int(pid), False)
         item["labs"] = self.d.labs[pid]
         item["repro"] = r[FEATURE_NAMES].to_numpy(np.float32)
         item["y_condition"] = r[COND_Y].to_numpy(np.float32)
@@ -123,7 +149,9 @@ def collate(items: list[dict]) -> dict[str, torch.Tensor]:
     out["ecg_present"] = torch.tensor([x["ecg_present"] for x in items])
     out["echo"] = torch.from_numpy(np.stack([x["echo"] for x in items]))
     out["echo_mask"] = torch.from_numpy(np.stack([x["echo_mask"] for x in items]))
-    for key, width in (("ehr", 4), ("labs", 3)):
+    out["ehr_scores"] = torch.from_numpy(np.stack([x["ehr_scores"] for x in items]).astype(np.float32))
+    out["ehr_present"] = torch.tensor([x["ehr_present"] for x in items])
+    for key, width in (("labs", 3),):
         L = max(1, max(len(x[key]) for x in items))
         arr = np.zeros((B, L, width), np.float32); m = np.zeros((B, L), bool)
         for i, x in enumerate(items):

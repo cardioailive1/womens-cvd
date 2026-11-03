@@ -19,3 +19,4 @@ pylibjpeg-openjpeg>=2.3
 google-cloud-bigquery>=3.11   # MCP warehouse (likely preinstalled in the workspace; ask MCP)
 db-dtypes>=1.2                # BigQuery -> pandas date/time types
 pyarrow>=14                   # BigQuery dataframe upload of helper tables
+xgboost>=2.0                  # optional: model.ehr_model.kind = xgboost (logistic regression needs only scikit-learn)
