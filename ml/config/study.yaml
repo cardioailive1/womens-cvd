@@ -145,6 +145,19 @@ reports:
     person_column: PATIENT_CLINIC_NUMBER   # TODO(MCP): confirm
     person_key: clinic_number
     date_column: null              # TODO(MCP): result date column (or via FACT_ECHO_TEST)
+  # Cardiologist-signed ECG reports (MCP ECG deck, 3 Nov 2026): ECG_INTERPRET_FULL_TEXT is the final
+  # narrative signed in MUSE (not by a fellow), ECG_INTERPRET_EXTENSION_TEXT the cardiologist's own
+  # comments. FACT_ECG is keyed by PATIENT_DK (reached through DIM_PATIENT); one ECG has several rows
+  # (one per interpretation snippet), collapsed here. Evidence for reviewers and the automatic audit
+  # only: no ECG model is trained.
+  ecg_reads:
+    table: mcp.FACT_ECG
+    title: "ECG report (cardiologist-signed)"
+    text_column: ECG_INTERPRET_FULL_TEXT
+    extra_text_column: ECG_INTERPRET_EXTENSION_TEXT
+    person_column: PATIENT_DK
+    person_key: patient_dk
+    date_column: ECG_DTM           # clinical ECG time (= the waveform's ACQUISITION_TS)
   radiology:
     enabled: false                 # already in OMOP NOTE; turn on only if NOTE lacks them
     table: mcp.FACT_RADIOLOGY
