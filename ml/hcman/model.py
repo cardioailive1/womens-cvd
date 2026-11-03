@@ -7,6 +7,9 @@ Two deliberate changes from the form, both explained in the protocol:
 2. Every stream can be missing. Each cross-attention appends a learned "null" key/value so a
    woman with no echo (say) attends to the null token instead of producing NaNs, and missing
    query streams are replaced by learned null queries.
+3. (Nov 2026) Stream 1 is a MobileNet1D instead of the 12-layer ECG transformer, and stream 3 is a
+   tabular EHR model (logistic regression or XGBoost, hcman.ehr_model) whose scores enter as one
+   token, instead of the CardioTransformer. MCP approved exporting both models' weights.
 """
 from __future__ import annotations
 
@@ -20,19 +23,21 @@ import torch.nn.functional as F
 from mcp_adapter.concepts import CONDITION_ORDER, LAB_ORDER
 from mcp_adapter.features.repro import REPRO_DIM
 
+from .ehr_model import N_SCORES
 from .elm import MultiLayerELM
 
 
 @dataclass
 class HCMANConfig:
-    # stream 1 — ECG transformer (form: 12L-12H, d=768)
-    ecg_dim: int = 768; ecg_layers: int = 12; ecg_heads: int = 12
-    ecg_patch: int = 50; ecg_samples: int = 5000; ecg_leads: int = 12
+    # stream 1 — ECG: MobileNet1D (depthwise-separable 1-D convolutions, SE, hard-swish) on the
+    # 12 x 5000 waveform -> 13 tokens (a global summary + 12 time segments), width ecg_dim
+    ecg_dim: int = 256; ecg_width: float = 1.0; ecg_samples: int = 5000; ecg_leads: int = 12
+    ecg_segments: int = 12
     # stream 2 — echo (form: MobileNetV3-Large -> 960 -> FC 512)
     echo_dim: int = 512; echo_views: int = 4; echo_frames: int = 8
     echo_backbone: str = "mobilenet_v3_large"      # or "tiny" for tests
-    # stream 3 — EHR BERT (form: 6L-8H, d=256)
-    ehr_dim: int = 256; ehr_layers: int = 6; ehr_heads: int = 8; ehr_vocab: int = 20000
+    # stream 3 — EHR: scores of the tabular EHR model (hcman.ehr_model) -> one token
+    ehr_dim: int = 256; ehr_scores: int = N_SCORES
     # stream 4 — ELM (form: 15 -> 128 -> 256 -> 128)
     repro_in: int = REPRO_DIM; elm_hidden: tuple[int, ...] = (128, 256, 128); repro_tokens: int = 4
     # stream 5 — labs causal decoder (form: 4L-4H, d=128)
@@ -46,8 +51,8 @@ class HCMANConfig:
 
     @classmethod
     def small(cls, **kw) -> "HCMANConfig":
-        base = dict(ecg_dim=64, ecg_layers=2, ecg_heads=4, echo_dim=64, echo_backbone="tiny",
-                    echo_frames=4, ehr_dim=64, ehr_layers=2, ehr_heads=4, labs_dim=32,
+        base = dict(ecg_dim=64, ecg_width=0.5, echo_dim=64, echo_backbone="tiny",
+                    echo_frames=4, ehr_dim=64, labs_dim=32,
                     labs_layers=1, labs_heads=2, d=64, f1_layers=1, f2_layers=1, f3_layers=1,
                     fusion_heads=4, f3_heads=2, ffn=128, elm_hidden=(32, 64, 32))
         base.update(kw)
@@ -90,48 +95,89 @@ def encoder(d: int, layers: int, heads: int, ffn: int, dropout: float) -> nn.Tra
 
 
 # ============================================================ stream 1 — ECG
-class CBAM1D(nn.Module):
-    """CBAM adapted to patch tokens: channel attention over the embedding dimension (shared
-    MLP on avg- and max-pooled tokens), then token ("spatial") attention from a 1-D conv over
-    the per-token avg/max — lets the model up-weight ST-segment and P-wave patches."""
+def _div(v: float, d: int = 8) -> int:
+    return max(d, int(v + d / 2) // d * d)
 
-    def __init__(self, d: int, reduction: int = 16, k: int = 7):
+
+def _gn(c: int) -> nn.GroupNorm:
+    """GroupNorm, not BatchNorm: no running statistics of training ECGs are stored in the weights,
+    and per-sample gradients (DP-SGD) stay valid."""
+    return nn.GroupNorm(next(g for g in (8, 4, 2, 1) if c % g == 0), c)
+
+
+class SE1D(nn.Module):
+    def __init__(self, c: int):
         super().__init__()
-        h = max(d // reduction, 4)
-        self.mlp = nn.Sequential(nn.Linear(d, h), nn.ReLU(), nn.Linear(h, d))
-        self.conv = nn.Conv1d(2, 1, k, padding=k // 2)
+        h = _div(c / 4)
+        self.fc = nn.Sequential(nn.Linear(c, h), nn.ReLU(), nn.Linear(h, c), nn.Hardsigmoid())
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:          # x: (B, N, d)
-        ca = torch.sigmoid(self.mlp(x.mean(1)) + self.mlp(x.amax(1)))
-        x = x * ca.unsqueeze(1)
-        s = torch.stack([x.mean(-1), x.amax(-1)], dim=1)           # (B, 2, N)
-        sa = torch.sigmoid(self.conv(s)).transpose(1, 2)           # (B, N, 1)
-        return x * sa
+    def forward(self, x):                                           # x: (B, C, T)
+        return x * self.fc(x.mean(-1)).unsqueeze(-1)
 
 
-class ECGTransformer(nn.Module):
+class InvertedResidual1D(nn.Module):
+    def __init__(self, cin: int, exp: int, cout: int, k: int, stride: int, se: bool, hs: bool):
+        super().__init__()
+        act = nn.Hardswish if hs else nn.ReLU
+        layers = []
+        if exp != cin:
+            layers += [nn.Conv1d(cin, exp, 1, bias=False), _gn(exp), act()]
+        layers += [nn.Conv1d(exp, exp, k, stride, k // 2, groups=exp, bias=False), _gn(exp), act()]
+        if se:
+            layers.append(SE1D(exp))
+        layers += [nn.Conv1d(exp, cout, 1, bias=False), _gn(cout)]
+        self.block = nn.Sequential(*layers)
+        self.res = stride == 1 and cin == cout
+
+    def forward(self, x):
+        y = self.block(x)
+        return x + y if self.res else y
+
+
+# kernel, expansion, out, SE, hard-swish, stride — MobileNetV3-Small's layout, 1-D kernels widened for
+# ECG (a 7-sample kernel at 250 Hz after the stem spans 28 ms). 5000 samples -> 79 time steps.
+MOBILENET1D_BLOCKS = [
+    (7, 16, 16, True, False, 2), (7, 64, 24, False, False, 2), (7, 72, 24, False, False, 1),
+    (5, 96, 40, True, True, 2), (5, 240, 40, True, True, 1), (5, 240, 40, True, True, 1),
+    (5, 120, 48, True, True, 1), (5, 144, 48, True, True, 1), (3, 288, 96, True, True, 2),
+    (3, 576, 96, True, True, 1), (3, 576, 96, True, True, 2),
+]
+
+
+def _segment_matrix(T: int, S: int, device, dtype) -> torch.Tensor:
+    """(T, S) averaging matrix with AdaptiveAvgPool1d's segments (start floor(iT/S), end ceil((i+1)T/S)).
+    A matmul exports to ONNX for any T; adaptive pooling does not when S does not divide T."""
+    W = torch.zeros(T, S, dtype=dtype)
+    for i in range(S):
+        a, b = (i * T) // S, -((-(i + 1) * T) // S)
+        W[a:b, i] = 1.0 / (b - a)
+    return W.to(device)
+
+
+class MobileNet1D(nn.Module):
+    """ECG encoder: (B, 12, 5000) -> (B, 1 + ecg_segments, ecg_dim) — a global token, then one
+    token per equal time segment of the 10 s strip (so fusion can attend to where in the strip)."""
+
     def __init__(self, c: HCMANConfig):
         super().__init__()
-        self.c = c
-        n_p = c.ecg_samples // c.ecg_patch
-        self.patch = nn.Linear(c.ecg_patch, c.ecg_dim)
-        self.lead_emb = nn.Parameter(torch.zeros(c.ecg_leads, c.ecg_dim))
-        self.pos_emb = nn.Parameter(torch.zeros(n_p, c.ecg_dim))
-        self.cls = nn.Parameter(torch.zeros(1, 1, c.ecg_dim))
-        nn.init.trunc_normal_(self.lead_emb, std=.02); nn.init.trunc_normal_(self.pos_emb, std=.02)
-        self.cbam = CBAM1D(c.ecg_dim)
-        self.enc = encoder(c.ecg_dim, c.ecg_layers, c.ecg_heads, 4 * c.ecg_dim, c.dropout)
+        w = c.ecg_width
+        cin = _div(16 * w)
+        layers = [nn.Conv1d(c.ecg_leads, cin, 15, 2, 7, bias=False), _gn(cin), nn.Hardswish()]
+        for k, e, o, se, hs, st in MOBILENET1D_BLOCKS:
+            e, o = _div(e * w), _div(o * w)
+            layers.append(InvertedResidual1D(cin, e, o, k, st, se, hs)); cin = o
+        last = _div(576 * w)
+        layers += [nn.Conv1d(cin, last, 1, bias=False), _gn(last), nn.Hardswish()]
+        self.features = nn.Sequential(*layers)
+        self.n_seg = c.ecg_segments
+        self.proj = nn.Linear(last, c.ecg_dim)
         self.norm = nn.LayerNorm(c.ecg_dim)
 
     def forward(self, ecg: torch.Tensor) -> torch.Tensor:
-        """ecg (B, 12, 5000) -> tokens (B, 13, ecg_dim): [CLS, one summary token per lead]."""
-        B, L, T = ecg.shape
-        p = ecg.reshape(B, L, T // self.c.ecg_patch, self.c.ecg_patch)
-        x = self.patch(p) + self.lead_emb[None, :, None] + self.pos_emb[None, None]
-        x = self.cbam(x.reshape(B, -1, self.c.ecg_dim))            # 1,200 patch tokens
-        x = self.norm(self.enc(torch.cat([self.cls.expand(B, -1, -1), x], 1)))
-        per_lead = x[:, 1:].reshape(B, L, -1, self.c.ecg_dim).mean(2)
-        return torch.cat([x[:, :1], per_lead], 1)
+        f = self.features(ecg)                                       # (B, C, T')
+        seg = f @ _segment_matrix(int(f.shape[-1]), self.n_seg, f.device, f.dtype)
+        tok = torch.cat([f.mean(-1, keepdim=True), seg], -1).transpose(1, 2)
+        return self.norm(self.proj(tok))
 
 
 # ============================================================ stream 2 — Echo
@@ -176,22 +222,20 @@ class EchoEncoder(nn.Module):
 
 
 # ============================================================ stream 3 — EHR
-class CardioTransformer(nn.Module):
+class EHRScoreEncoder(nn.Module):
+    """The tabular EHR model's scores (hcman.ehr_model: a logit per target, tier log-probabilities)
+    -> one EHR token. Women with no coded history get a learned token instead."""
+
     def __init__(self, c: HCMANConfig):
         super().__init__()
-        self.tok = nn.Embedding(c.ehr_vocab, c.ehr_dim, padding_idx=0)
-        self.typ = nn.Embedding(8, c.ehr_dim)
-        self.val = nn.Linear(1, c.ehr_dim)
-        self.enc = encoder(c.ehr_dim, c.ehr_layers, c.ehr_heads, 4 * c.ehr_dim, c.dropout)
-        self.norm = nn.LayerNorm(c.ehr_dim)
-        self.mlm = nn.Linear(c.ehr_dim, c.ehr_vocab)                # pre-training head
-        self.dim = c.ehr_dim
+        self.mlp = nn.Sequential(nn.Linear(c.ehr_scores, c.ehr_dim), nn.GELU(), nn.Linear(c.ehr_dim, c.ehr_dim),
+                                 nn.LayerNorm(c.ehr_dim))
+        self.null = nn.Parameter(torch.zeros(1, 1, c.ehr_dim))
 
-    def forward(self, ehr: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """ehr (B, L, 4) [token, type, value, rel_day]; mask (B, L) True = real token."""
-        x = (self.tok(ehr[..., 0].long()) + self.typ(ehr[..., 1].long())
-             + self.val(ehr[..., 2:3]) + time_encoding(ehr[..., 3], self.dim))
-        return self.norm(self.enc(x, src_key_padding_mask=~mask))
+    def forward(self, scores: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
+        """scores (B, S) float, present (B,) bool -> (B, 1, ehr_dim)."""
+        x = self.mlp(scores / 4.0).unsqueeze(1)                     # logits clipped to +-10
+        return torch.where(present[:, None, None], x, self.null.expand(x.shape[0], -1, -1))
 
 
 # ============================================================ stream 5 — labs
@@ -242,9 +286,9 @@ class HCMAN(nn.Module):
     def __init__(self, c: HCMANConfig, elm: MultiLayerELM | None = None):
         super().__init__()
         self.c = c
-        self.ecg = ECGTransformer(c)
+        self.ecg = MobileNet1D(c)
         self.echo = EchoEncoder(c)
-        self.ehr = CardioTransformer(c)
+        self.ehr = EHRScoreEncoder(c)
         self.elm = elm or MultiLayerELM(c.repro_in, c.elm_hidden)
         self.labs = TemporalTransformer(c)
         d = c.d
@@ -252,7 +296,7 @@ class HCMAN(nn.Module):
         self.p_ecg, self.p_echo = nn.Linear(c.ecg_dim, d), nn.Linear(c.echo_dim, d)
         self.p_ehr = nn.Linear(c.ehr_dim, d)
         self.repro_tok = nn.Linear(c.elm_hidden[-1], c.repro_tokens * c.elm_hidden[-1])
-        self.null_ecg = nn.Parameter(torch.zeros(1, 1 + c.ecg_leads, d))
+        self.null_ecg = nn.Parameter(torch.zeros(1, 1 + c.ecg_segments, d))
         # F1 imaging pre-fusion: ECG queries echo
         self.f1 = nn.ModuleList(CrossBlock(d, d, c.fusion_heads, c.ffn, c.dropout) for _ in range(c.f1_layers))
         # F2 clinical integration: bidirectional imaging <-> EHR
@@ -283,7 +327,7 @@ class HCMAN(nn.Module):
         return self
 
     def forward(self, b: dict[str, torch.Tensor], grl_lambda: float = 1.0) -> dict[str, torch.Tensor]:
-        B = b["ehr"].shape[0]
+        B = b["repro"].shape[0]
         # ---- encoders
         ecg_present = b["ecg_present"]
         if self.export_mode or ecg_present.any():
@@ -292,7 +336,7 @@ class HCMAN(nn.Module):
         else:
             q = self.null_ecg.expand(B, -1, -1)
         echo_tok = self.p_echo(self.echo(b["echo"], b["echo_mask"]))
-        ehr_tok = self.p_ehr(self.ehr(b["ehr"], b["ehr_mask"]))
+        ehr_tok = self.p_ehr(self.ehr(b["ehr_scores"], b["ehr_present"]))      # (B, 1, d)
         r = self.elm(b["repro"])                                      # (B, 128), ELM is frozen
         repro_tok = self.repro_tok(r).reshape(B, self.c.repro_tokens, -1)
         labs_tok, labs_keep = self.labs(b["labs"], b["labs_mask"])
@@ -301,12 +345,12 @@ class HCMAN(nn.Module):
         for blk in self.f1:
             q = blk(q, echo_tok, b["echo_mask"])
         # ---- F2: imaging <-> EHR (bidirectional)
-        ehr_keep = b["ehr_mask"]
+        ehr_keep = torch.ones(B, 1, dtype=torch.bool, device=ehr_tok.device)
         for bi, be in zip(self.f2_img, self.f2_ehr):
             q_new = bi(q, ehr_tok, ehr_keep)
             ehr_tok = be(ehr_tok, q, torch.ones(B, q.shape[1], dtype=torch.bool, device=q.device))
             q = q_new
-        f2 = torch.cat([q, ehr_tok[:, :1]], 1)                       # imaging tokens + EHR CLS
+        f2 = torch.cat([q, ehr_tok], 1)                              # imaging tokens + EHR token
         # ---- F3: women's context (parallel)
         a, l = f2, f2
         repro_keep = torch.ones(B, repro_tok.shape[1], dtype=torch.bool, device=f2.device)

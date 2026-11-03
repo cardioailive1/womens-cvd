@@ -86,7 +86,7 @@ def main(argv=None):
     torch.manual_seed(cfg.seed); np.random.seed(cfg.seed)
 
     if a.init_weights and not a.preprocessors:
-        ap.error("--init-weights needs --preprocessors from the same pre-training run (token ids must match)")
+        ap.error("--init-weights needs --preprocessors from the same pre-training run (lab encoding must match)")
     pre = None
     if a.preprocessors:
         from .data import Preprocessors
@@ -96,7 +96,7 @@ def main(argv=None):
     data = StudyData(a.study_dir, cfg, pre)
     size = a.size or cfg.model_size
     mk = HCMANConfig.small if size == "small" else HCMANConfig
-    mc = mk(ehr_vocab=data.pre.ehr.vocab_size, n_sites=max(len(data.pre.sites), 1),
+    mc = mk(n_sites=max(len(data.pre.sites), 1),
             condition_head=cfg.condition_head)
     elm = MultiLayerELM(mc.repro_in, mc.elm_hidden, seed=cfg.seed).fit(data.repro_matrix("train"))
     model = HCMAN(mc, elm).to(dev)
@@ -110,6 +110,7 @@ def main(argv=None):
         log.warning("no --init-weights: all encoders start from random initialization")
     n_params = sum(p.numel() for p in model.parameters())
     log.info("HCMAN %s: %.1fM parameters", size, n_params / 1e6)
+    log.info("EHR model: %s on %d diagnosis / drug-class features", data.pre.ehr.kind, len(data.pre.ehr.features))
 
     T = mc.echo_frames
     tr = data.split("train", echo_frames=T, load_imaging=not a.no_imaging)

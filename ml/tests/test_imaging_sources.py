@@ -175,7 +175,10 @@ def test_extract_mayo_fact_ecg_waveform(db, tmp_path):
         db.execute(f"CREATE OR REPLACE TABLE {t} AS SELECT * FROM {src}")
     cfg = cfg_for(tmp_path)
     assert cfg.ecg_table["format"] == "mayo_waveform" and cfg.dim_patient["table"] == "mcp.DIM_PATIENT"
-    cfg.ecg_table.update(table="fact_ecg_waveform", sample_rate_table="fact_ecg_meas")
+    assert cfg.ecg_table["person_key"] == "clinic_number" and cfg.ecg_table["rhythm_value"] == "rhythm"
+    cfg.ecg_table.update(table="fact_ecg_waveform", sample_rate_table="fact_ecg_meas", sample_rate_column="ECGSAMPLEBASE",
+                         person_key="patient_dk", person_column="PATIENT_DK", ekg_type_column=None,
+                         sample_rate_keys=["PATIENT_DK", "ACQUISITION_TS"])
     cfg.dim_patient.update(table="dim_patient")
     man = extract_ecg_table(DuckDBBackend(db), cfg, tmp_path / "ecg", person_ids=people.person_id.tolist())
     assert len(man) == 4                                   # 4 women; the second-system copy is not double-counted
@@ -229,3 +232,30 @@ def test_submission_takes_patient_dk_from_dim_patient(db, tmp_path):
     cfg.dicom_inventory["patient_dk_source"] = "bogus"
     with pytest.raises(ValueError, match="patient_dk_source"):
         build_dicom_request(DuckDBBackend(db), cfg, tmp_path / "r2.csv")
+
+
+def test_extract_ecg_by_clinic_number_resting_only(db, tmp_path):
+    """MCP ECG deck (3 Nov 2026): FACT_ECG_WAVEFORM carries PATIENT_CLINIC_NUMBER, 'rhythm' in lower
+    case, EKG_TYPE = 'resting'; the rate follows from the record length (2,500 -> 250 Hz)."""
+    from urllib.parse import quote
+    people = db.execute("SELECT person_id, person_source_value FROM omop_cdm.person ORDER BY person_id LIMIT 3").df()
+    enc = lambda v: quote(base64.b64encode(v.astype("<i2").tobytes()).decode(), safe="")
+    sig = lambda n: (np.sin(np.arange(n) / 30) * 400).astype("<i2")
+    rows = []
+    for k, r in enumerate(people.itertuples()):
+        n = 2500 if k == 0 else 5000
+        for l in LEADS8:
+            rows.append((r.person_source_value, "2020-03-01 10:00:00", l, "rhythm", "resting", enc(sig(n))))
+            rows.append((r.person_source_value, "2020-03-01 10:00:00", l, "median", "resting", enc(sig(600))))
+            if k == 2:   # a stress ECG for the third woman: not a resting ECG, never used
+                rows.append((r.person_source_value, "2020-04-01 10:00:00", l, "rhythm", "stress", enc(sig(5000))))
+    db.execute("CREATE SCHEMA IF NOT EXISTS mcp")
+    db.register("w3", pd.DataFrame(rows, columns=["PATIENT_CLINIC_NUMBER", "ACQUISITION_TS", "LEAD_ID",
+                                                  "WAVEFORM_TYPE", "EKG_TYPE", "WAVEFORM"]))
+    db.execute("CREATE OR REPLACE TABLE mcp.FACT_ECG_WAVEFORM AS SELECT * FROM w3")
+    cfg = cfg_for(tmp_path)                                     # shipped config, nothing overridden
+    man = extract_ecg_table(DuckDBBackend(db), cfg, tmp_path / "ecg", person_ids=people.person_id.tolist())
+    assert len(man) == 3 and set(man.record_date.astype(str)) == {"2020-03-01"}
+    assert sorted(man.fs.tolist()) == [250, 500, 500]
+    for p in man.path:
+        assert load_ecg(p, "npy_dir").shape == (12, N_SAMPLES)

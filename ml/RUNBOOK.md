@@ -13,7 +13,7 @@ flowchart LR
     S2b --> S3["3 · Feasibility<br/>Gate 1: enough cases"]
     S3 --> S4["4 · Study tables<br/>Gates 2, 3: imaging, sites"]
     S4 --> S4a["4a · Qualify reviewers<br/>synthetic kit, off-platform"] --> S4b["4b · Audit labels<br/>automatic, then 2 tiers"]
-    S4b --> S5["5 · Pre-train<br/>4 stages, no labels"]
+    S4b --> S5["5 · Pre-train<br/>3 stages, no labels"]
     S5 --> S6["6 · Fine-tune<br/>ablation, then full"]
     S6 --> S7["7 · Evaluate<br/>accept or iterate"]
     S7 -- "iterate: new run folder" --> S6
@@ -95,6 +95,12 @@ Everyone who audits needs a workspace account and DUA, and is listed by user nam
 - **Dates:** `RADIOLOGY_DTM` is when the imaging was performed and `RADIOLOGY_REVIEW_DTM` when it was reviewed; the code uses the former. Reports link to images through `ACCESSION_NBR` = `DICOM_ACCESSION_NUMBER`. DICOM inventory data is not in OMOP.
 
 **From MCP's ECG deck (3 Nov 2026):** the cardiologist-signed ECG report is `FACT_ECG.ECG_INTERPRET_FULL_TEXT`, signed in MUSE by a cardiologist, not a fellow; only validated reads reach the platform. `ECG_INTERPRET_EXTENSION_TEXT` holds the cardiologist's own comments. `FACT_ECG` is keyed by `PATIENT_DK` (reached through `DIM_PATIENT`) and has one row per interpretation snippet. These reports are shown to reviewers and read by the automatic audit as the `reports.ecg_reads` source, titled "ECG report (cardiologist-signed)". No ECG model is trained. The audit treats a finding followed by "age undetermined", "old" or "remote" (for example "Inferior MI, old") as historical, not new.
+
+**Model change (3 Nov 2026), approved by MCP for weight export:** stream 1 (ECG) is a MobileNet1D, about 1.0M parameters, in place of the 12-layer ECG transformer. Stream 3 (EHR) is a tabular model, logistic regression by default or XGBoost (`model.ehr_model.kind`), in place of the CardioTransformer.
+- **EHR features:** whether each diagnosis category (ICD-10-CM, three characters) and drug class (ATC level 4) appears in the lookback year. Label codes are never features, and a feature must be held by at least 11 training women.
+- **How it feeds HCMAN:** its per-target scores enter as one EHR token. Training women get out-of-fold scores.
+- **Pre-training:** three stages: ECG, echo and labs.
+- **Total size:** about 52M parameters, in line with the form.
 
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
 
@@ -445,7 +451,7 @@ Goal: every encoder learns from Mayo data without labels before it sees the coho
        --out $WB/pretrain_smoke --epochs 1
    ```
 
-   Read each stage's epoch time from the log and multiply by the configured epochs (ECG 30, echo 30, EHR 20, labs 20). `pretraining.batch_size` is 64 for the 40 GB A100s; if memory runs out, lower it to 32.
+   Read each stage's epoch time from the log and multiply by the configured epochs (ECG 30, echo 30, labs 20; the EHR stream is a tabular model fitted during fine-tuning, so it has no pre-training stage). `pretraining.batch_size` is 64 for the 40 GB A100s; if memory runs out, lower it to 32.
 3. **Run the full pre-training** in the background so it survives a closed browser tab:
 
    ```bash
@@ -456,10 +462,10 @@ Goal: every encoder learns from Mayo data without labels before it sees the coho
 
    If the GPU session ends part-way, run the same command again with `--resume`: finished stages are kept and the unfinished one continues from its last completed epoch.
 
-   Stages can also run one at a time, for example on separate GPUs in separate sessions, with `--stages ecg`, `--stages echo`, `--stages ehr,labs` and different `--out` folders; merge them afterwards (Troubleshooting).
+   Stages can also run one at a time, for example on separate GPUs in separate sessions, with `--stages ecg`, `--stages echo`, `--stages labs` and different `--out` folders; merge them afterwards (Troubleshooting).
 4. **Check the result.** `$WB/pretrain/` holds `encoders.pt` and `preprocessors.pkl`; `reports/08_pretraining_summary.json` lists the stages done and the loss per epoch.
 
-**Go when:** `stages_done` lists ecg, echo, ehr and labs, and each stage's loss falls over its epochs and then flattens. A loss that never falls means that stage learned nothing; see Troubleshooting.
+**Go when:** `stages_done` lists ecg, echo and labs, and each stage's loss falls over its epochs and then flattens. A loss that never falls means that stage learned nothing; see Troubleshooting.
 
 ## Step 6 — Fine-tune: ablation first, then the full model
 
@@ -531,8 +537,8 @@ Goal: the accepted model leaves the platform through the Model Details Form revi
    ls $WB/hcman_export
    ```
 
-   Expect `hcman.onnx`, `hcman.torchscript.pt`, `hcman_int8_state_dict.pt`, `contract.json`, `preprocessors.pkl`, `thresholds.json`. These hold weights and fitted statistics only, no patient rows. The vocabulary in `preprocessors.pkl` keeps only codes seen in at least 5 women.
-2. **Submit for export.** Update the Model Details Form before submitting: about 152M parameters (not ~52M), multi-label condition head, no SMOTE, sites are Mayo campuses, from-scratch pre-training inside MCP. Request export of the bundle and of the suppressed report folders.
+   Expect `hcman.onnx`, `hcman.torchscript.pt`, `hcman_int8_state_dict.pt`, `contract.json`, `ehr_model.json`, `preprocessors.pkl`, `thresholds.json`. These hold weights and fitted statistics only, no patient rows. `ehr_model.json` is the tabular EHR model: its feature list (diagnosis categories and drug classes held by at least 11 training women) and the coefficients (logistic regression) or trees (XGBoost).
+2. **Submit for export.** Update the Model Details Form before submitting: ECG stream is a MobileNet1D (about 1.0M parameters) and the EHR stream a tabular model (logistic regression or XGBoost) whose scores feed HCMAN, both approved by MCP for weight export; about 52M parameters in total; multi-label condition head, no SMOTE, sites are Mayo campuses, from-scratch pre-training inside MCP. Request export of the bundle and of the suppressed report folders.
 3. **Run the inference service** on a HIPAA-eligible host on your private network (it receives patient data from the app):
 
    ```bash
@@ -576,7 +582,7 @@ Known gap: the app does not yet send ECG, echo, diagnosis history or medications
 ```python
 import torch, shutil
 merged = {}
-for d in ["pretrain_ecg", "pretrain_echo", "pretrain_ehr_labs"]:
+for d in ["pretrain_ecg", "pretrain_echo", "pretrain_labs"]:
     merged.update(torch.load(f"{WB}/{d}/encoders.pt"))
 torch.save(merged, f"{WB}/pretrain/encoders.pt")
 shutil.copy(f"{WB}/pretrain_ecg/preprocessors.pkl", f"{WB}/pretrain/preprocessors.pkl")
@@ -615,7 +621,7 @@ Tick each item as it is done; write the run folder names and decisions next to t
 **Training**
 
 - [ ] Step 5: pool built (report 07); 1-epoch timing done
-- [ ] Step 5: pre-training finished; all four stages in report 08
+- [ ] Step 5: pre-training finished; all three stages (ecg, echo, labs) in report 08
 - [ ] Step 6: ablation run finished (`run_ablation`)
 - [ ] Step 6: full run finished (`run_full`)
 

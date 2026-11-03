@@ -68,6 +68,7 @@ class StudyConfig:
     audit: dict = field(default_factory=dict)
     training: dict = field(default_factory=dict)
     mace_primary: dict = field(default_factory=dict)
+    ehr_model: dict = field(default_factory=dict)
 
     pretrain: dict[str, int] = field(default_factory=lambda: {
         "max_women": 200000, "ecg_epochs": 30, "echo_epochs": 30, "ehr_epochs": 20,
@@ -126,6 +127,7 @@ class StudyConfig:
         cfg.audit = raw.get("audit") or {}
         cfg.training = raw.get("training") or {}
         cfg.mace_primary = (raw.get("outcomes") or {}).get("mace_primary_diagnosis") or {}
+        cfg.ehr_model = (raw.get("model") or {}).get("ehr_model") or {}
         cfg.report_sources = {k: v for k, v in (raw.get("reports") or {}).items()
                               if v and v.get("enabled", True)}
         for k, v in overrides.items():
