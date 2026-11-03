@@ -140,25 +140,48 @@ WHERE {d('x.note_date')} BETWEEN {lo} AND {hi}""")
 
 
 def report_notes(be: Backend, cfg: StudyConfig, name: str, src: dict, lo: int, hi: int) -> pd.DataFrame:
-    """Free-text reports from a Mayo-native table (e.g. echo notes, radiology reports) configured
-    under `reports:` in study.yaml. Skipped, not failed, until all four columns are configured."""
+    """Free-text reports from a Mayo-native table (e.g. echo notes, radiology reports, signed ECG
+    reports) configured under `reports:` in study.yaml. Skipped, not failed, until all four columns
+    are configured.
+
+    person_key: person_id (OMOP id in the table) | clinic_number (PATIENT_CLINIC_NUMBER, mapped through
+    platform.person_map) | patient_dk (PATIENT_DK, through DIM_PATIENT to the clinic number).
+    extra_text_column: appended to the text (e.g. the cardiologist's ECG comments). `title`: what the
+    reviewer sees (default: the source name). Rows repeated per snippet (FACT_ECG) are collapsed."""
     empty = pd.DataFrame(columns=["person_id", "rel_day", "title", "text"])
     need = ("table", "person_column", "date_column", "text_column")
     if not all(src.get(k) for k in need):
         return empty
     d = days_between(cfg.dialect, f"r.{src['date_column']}", "w.index_date")
     try:
-        if src.get("person_key", "person_id") == "clinic_number":     # Mayo-native patient key
+        key = src.get("person_key", "person_id")
+        if key in ("clinic_number", "patient_dk"):                    # Mayo-native patient keys
             from mcp_adapter.imaging_sources import person_join
-            join = (f"{person_join(cfg, 'pm', 'r.' + src['person_column'])} "
-                    f"JOIN {REVIEW_VIEW} w ON w.person_id = pm.person_id")
+            if key == "patient_dk":
+                dim = cfg.dim_patient
+                mc = f"dp.{dim['clinic_number_column']}"
+                hop = f"JOIN {dim['table']} dp ON dp.{dim['dk_column']} = r.{src['person_column']} "
+            else:
+                mc, hop = f"r.{src['person_column']}", ""
+            join = f"{hop}{person_join(cfg, 'pm', mc)} JOIN {REVIEW_VIEW} w ON w.person_id = pm.person_id"
             pid = "pm.person_id"
-        else:
+        elif key == "person_id":
             join, pid = f"JOIN {REVIEW_VIEW} w ON w.person_id = r.{src['person_column']}", f"r.{src['person_column']}"
-        return be.sql(f"""
-SELECT {pid} AS person_id, {d} AS rel_day, '{name}' AS title, r.{src['text_column']} AS text
+        else:
+            raise ValueError(f"reports.{name}.person_key must be person_id, clinic_number or patient_dk, not {key!r}")
+        text = f"CAST(r.{src['text_column']} AS STRING)"
+        if src.get("extra_text_column"):
+            text = (f"CONCAT(COALESCE({text}, ''), ' ', "
+                    f"COALESCE(CAST(r.{src['extra_text_column']} AS STRING), ''))")
+        title = str(src.get("title") or name).replace("'", "''")
+        out = be.sql(f"""
+SELECT DISTINCT {pid} AS person_id, {d} AS rel_day, '{title}' AS title, {text} AS text
 FROM {src['table']} r {join}
 WHERE {d} BETWEEN {lo} AND {hi}""")
+        out["text"] = out.text.astype(str).str.strip()
+        return out[out.text.ne("") & out.text.ne("None")].reset_index(drop=True)
+    except ValueError:
+        raise
     except Exception as e:
         import logging
         logging.getLogger("annotate.phenotype").warning("report source %s skipped: %s", name, e)

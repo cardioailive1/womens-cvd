@@ -221,3 +221,40 @@ def test_phenotype_review(tmp_path):
     assert ppv.n_reviewed == 15 and 0.8 <= float(ppv.value) <= 1.0
     assert len(store.latest(task_name("SCAD"))) == 30
     PhenotypeReviewer(s, ctx, store, annotator="tester").show()        # queue now empty, still renders
+
+
+def test_signed_ecg_reports_as_review_source(tmp_path):
+    """FACT_ECG (MCP ECG deck, 3 Nov 2026): keyed by PATIENT_DK, several rows per ECG (one per
+    interpretation snippet) repeating the signed full text; shown once, with the extension text."""
+    import duckdb
+    from annotate.phenotype import REVIEW_VIEW, report_notes
+    from mcp_adapter.backend import DuckDBBackend
+    from mcp_adapter.config import StudyConfig
+    from tests.synthetic_omop import load_into_duckdb
+    con = duckdb.connect(); load_into_duckdb(con)
+    p = con.execute("SELECT person_id, person_source_value FROM omop_cdm.person ORDER BY person_id LIMIT 2").df()
+    con.register("dims", pd.DataFrame({"PATIENT_DK": [5001, 5002], "PATIENT_CLINIC_NUMBER": p.person_source_value}))
+    con.execute("CREATE SCHEMA IF NOT EXISTS mcp; CREATE TABLE mcp.dim_patient AS SELECT * FROM dims")
+    rows = [(5001, "2020-01-05 10:00:00", k, "Sinus rhythm. ST elevation, consider acute MI. Abnormal ECG",
+             "Compared with prior, new ST changes") for k in (1, 2, 3)]
+    rows += [(5002, "2020-01-03 09:00:00", 1, "Normal sinus rhythm. Inferior infarct, old", None),
+             (5002, "2018-01-01 09:00:00", 1, "Outside the window", None)]
+    con.register("ecg", pd.DataFrame(rows, columns=["PATIENT_DK", "ECG_DTM", "ECG_INTERPRET_SEQ_NBR",
+                                                    "ECG_INTERPRET_FULL_TEXT", "ECG_INTERPRET_EXTENSION_TEXT"]))
+    con.execute("CREATE TABLE mcp.fact_ecg AS SELECT * FROM ecg")
+    be = DuckDBBackend(con)
+    cfg = StudyConfig.load(ROOT / "config/study.yaml", dialect="duckdb", cdm_schema="omop_cdm",
+                           vocab_schema="omop_cdm", report_dir=str(tmp_path / "rep"))
+    src = dict(cfg.report_sources["ecg_reads"], table="mcp.fact_ecg")
+    assert src["person_key"] == "patient_dk" and src["text_column"] == "ECG_INTERPRET_FULL_TEXT"
+    cfg.dim_patient.update(table="mcp.dim_patient")
+    be.register(pd.DataFrame({"person_id": p.person_id, "index_date": pd.to_datetime(["2020-01-01", "2020-01-01"])}),
+                REVIEW_VIEW)
+    out = report_notes(be, cfg, "ecg_reads", src, -30, 365)
+    assert len(out) == 2 and set(out.title) == {"ECG report (cardiologist-signed)"}
+    first = out[out.person_id == p.person_id[0]].iloc[0]
+    assert first.rel_day == 4 and first.text.endswith("new ST changes")      # snippets collapsed, comments kept
+    from annotate.auto_audit import mentions
+    assert "affirmed" in mentions(first.text, "mace")
+    assert mentions("Inferior MI, old", "mace") == ["historical"]
+    assert mentions("Acute MI in a 45 year old woman", "mace") == ["affirmed"]

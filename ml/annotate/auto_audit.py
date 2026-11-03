@@ -80,6 +80,8 @@ NEGATION = re.compile(r"\b(no|not|denies|denied|without|negative\s+for|ruled?\s+
                       r"unlikely|excluded|free\s+of|no\s+evidence\s+of|absence\s+of|not\s+consistent\s+with)\b"
                       r"[^.;:\n]{0,40}$", re.I)
 HISTORY = re.compile(r"\b(history\s+of|hx\s+of|h/o|prior|previous|remote|in\s+20\d\d)\b[^.;:\n]{0,30}$", re.I)
+# ECG statements put the age after the finding: "Anterior infarct, age undetermined", "Inferior MI, old"
+HISTORY_AFTER = re.compile(r"^[^.;:\n]{0,25}?(\bage\s+undetermined\b|(?<!year\s)(?<!year-)(?<!years\s)\bold\b|\bremote\b)", re.I)
 FAMILY = re.compile(r"\b(mother|father|sister|brother|aunt|family\s+history|FHx)\b[^.;:\n]{0,30}$", re.I)
 IATROGENIC = re.compile(r"iatrogenic|catheter[- ]induced|guide\s*catheter|procedur(e|al)[- ]related\s+dissection|"
                         r"dissection\s+(during|after|following|complicating)\s+(the\s+)?(pci|cath|angioplasty|stent|intervention)|"
@@ -102,7 +104,7 @@ def mentions(text: str, condition: str) -> list[str]:
                 out.append("negated")
             elif FAMILY.search(before):
                 out.append("family")
-            elif HISTORY.search(before):
+            elif HISTORY.search(before) or HISTORY_AFTER.search(text[m.end():m.end() + 60]):
                 out.append("historical")
             else:
                 out.append("affirmed")
