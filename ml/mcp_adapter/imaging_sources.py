@@ -153,6 +153,11 @@ GROUP BY a.study_uid""")
                         {"item": "studies left out of the submission: no PATIENT_DK", "n": int(no_dk.sum())},
                         *({"item": k, "n": v} for k, v in dk_notes.items())])
     write_report(suppress(rep, ["n"], cfg.min_cell_size), "00_dicom_request", cfg.report_dir)
+    if "description" in df:      # which study descriptions were selected: check against the Term Finder
+        desc = (df.assign(description=df.description.fillna("(none)").astype(str).str.upper().str.strip())
+                  .groupby("description").agg(n_studies=("study_uid", "nunique"), n_women=("person_id", "nunique"))
+                  .reset_index().sort_values("n_studies", ascending=False))
+        write_report(suppress(desc, ["n_studies", "n_women"], cfg.min_cell_size), "00_dicom_descriptions", cfg.report_dir)
     log.info("request list: %d studies (%d dated) for %d women -> %s",
              len(df), int(df.dated.sum()), df.person_id.nunique(), out_csv)
     return df
@@ -280,7 +285,7 @@ def _extract_mayo_waveform(be: Backend, cfg: StudyConfig, out_dir, person_ids, b
     if src.get("ekg_type_column") and src.get("ekg_type_value"):     # resting ECGs only
         where += (f" AND UPPER(CAST(w.{src['ekg_type_column']} AS STRING)) = "
                   f"'{str(src['ekg_type_value']).upper()}'")
-    rows, failed, ambiguous, seen = [], 0, 0, set()
+    rows, failed, ambiguous, several, seen = [], 0, 0, 0, set()
     for s0 in range(0, len(person_ids), batch_people):
         be.register(pd.DataFrame({"person_id": person_ids[s0:s0 + batch_people]}), "hcman_ecg_people")
         df = be.sql(f"""
@@ -297,9 +302,11 @@ WHERE {where}""")
             seen.add((pid, acq))
             g = g.drop_duplicates(["lead", "payload"])
             fs = g.fs.dropna().iloc[0] if "fs" in g and g.fs.notna().any() else None
+            notes = {}
             try:
                 x, fs = leads_from_records(g.lead, g.payload, fs, float(src.get("units_per_bit", 4.88)),
-                                           bool(src.get("url_encoded", True)))
+                                           bool(src.get("url_encoded", True)), notes=notes)
+                several += bool(notes.get("several_complete"))
             except AmbiguousECG as e:
                 ambiguous += 1; log.debug("ECG %s %s ambiguous: %s", pid, acq, e); continue
             except Exception as e:                                   # skip, count, keep going
@@ -312,7 +319,8 @@ WHERE {where}""")
     man.to_csv(out / "manifest.csv", index=False)
     write_report(suppress(pd.DataFrame([{"item": "ECGs extracted", "n": len(man)},
                                         {"item": "ECGs unreadable", "n": failed},
-                                        {"item": "ECGs skipped: several records per lead, none the full 10 s", "n": ambiguous},
+                                        {"item": "ECGs skipped: a lead with only partial records (order unknown)", "n": ambiguous},
+                                        {"item": "ECGs with a lead holding several complete records (one used)", "n": several},
                                         {"item": "ECGs at 250 Hz (resampled to 500)", "n": int((man.fs == 250).sum())}]),
                           ["n"], cfg.min_cell_size), "00_ecg_extraction", cfg.report_dir)
     log.info("extracted %d ECGs (%d unreadable, %d ambiguous) -> %s", len(man), failed, ambiguous, out / "manifest.csv")

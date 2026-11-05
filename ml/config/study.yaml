@@ -28,7 +28,7 @@ platform:
     patient_dk_column: PATIENT_DK           # required in the de-identification submission CSV
     # The Radiology deck (2 Nov 2026) lists no PATIENT_DK in the inventory: auto uses the inventory
     # column when present, otherwise DIM_PATIENT via PATIENT_CLINIC_NUMBER (PATIENT_MERGED_FLAG = 'N').
-    patient_dk_source: auto                 # auto | inventory | dim_patient
+    patient_dk_source: dim_patient          # confirmed by MCP (Adam Resnick, 5 Nov 2026); auto | inventory | dim_patient
     study_uid_column: STUDY_INSTANCE_UID
     series_uid_column: SERIES_INSTANCE_UID
     accession_column: DICOM_ACCESSION_NUMBER   # = FACT_RADIOLOGY.ACCESSION_NBR
@@ -38,6 +38,8 @@ platform:
     deid_status_column: IMAGE_DEID_STATUS
     deid_ok: [Ready, Available]             # only these can be submitted for de-identification
     modalities: [US]                        # US = echo (also obstetric, vascular... filtered below)
+    # Our choice (MCP, 5 Nov 2026): confirm the values with the Term Finder in My_First_Query.ipynb
+    # (/data/intro/Introduction_Notebooks/Accelerate) and report 00's description counts.
     description_pattern: "ECHO|TTE|TRANSTHORACIC|CARDIAC|HEART"   # MCP: search STUDY_DESCRIPTION for echo
     # The model reads transthoracic views (PLAX, PSAX, A4C, A2C): drop fetal echo (pregnancy
     # strata) and transoesophageal studies. Check report 05 for descriptions still let through.
@@ -88,12 +90,12 @@ platform:
     ekg_type_value: resting
     url_encoded: true
     units_per_bit: 4.88              # counts -> microvolts
-    # Sampling rate: the deck confirms 2,500 rhythm samples per lead = 250 Hz and 5,000 = 500 Hz, which
-    # the code infers from the record length. To read ECGSAMPLEBASE instead, set the table and its
-    # join keys (not stated by MCP) here.
-    sample_rate_table: null          # e.g. mcp.FACT_ECG_WAVEFORM_RESTING_MEASUREMENT
-    sample_rate_column: null         # e.g. ECGSAMPLEBASE
-    sample_rate_keys: null
+    # Sampling rate: ECGSAMPLEBASE, joined on PATIENT_DK + ACQUISITION_TS (Tommy Stretch, 5 Nov 2026).
+    # Where it is missing, the rate comes from the record length (2,500 samples = 250 Hz, 5,000 = 500).
+    # A lead with several complete rhythm records uses one; only partial records -> ECG skipped (report 00).
+    sample_rate_table: mcp.FACT_ECG_WAVEFORM_RESTING_MEASUREMENT
+    sample_rate_column: ECGSAMPLEBASE
+    sample_rate_keys: [PATIENT_DK, ACQUISITION_TS]
   ecg_source:
     kind: npy_dir                # the .npz files written by `imaging_sources ecg`
     path: null                   # set to the extraction output folder (e.g. $WB/ecg_npz)
@@ -133,7 +135,9 @@ reports:
     person_key: clinic_number      # clinic_number (mapped via platform.person_map) | person_id
     date_column: null              # TODO(MCP): echo date column
     # Exact test performed (TTE / TEE / stress), MCP 28 Oct 2026: FACT_ECHO_TEST.ECHO_PERFORMED_TEST_DK
-    # joins DIM_ECHO_TEST; match it to the DICOM STUDY_DESCRIPTION when a day has several echos.
+    # joins DIM_ECHO_TEST. DIM_ECHO_TEST is a lookup of test types only, with nothing patient- or
+    # exam-specific (MCP, 5 Nov 2026), so it cannot by itself pick the DICOM study on a day with
+    # several echos. TODO(MCP): how to match those; discussed with Adam on 5 Nov.
     performed_test_dk_column: ECHO_PERFORMED_TEST_DK
     test_dim_table: mcp.DIM_ECHO_TEST
   # Structured LVEF (MCP, 28 Oct 2026): result types in DIM_ECHO_TEST_RESULT_TYPE, chosen by

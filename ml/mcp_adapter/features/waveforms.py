@@ -120,13 +120,16 @@ class AmbiguousECG(ValueError):
 
 
 def leads_from_records(lead_ids, payloads, fs: int | None = None, units_per_bit: float = 4.88,
-                       url_encoded: bool = True, seconds: int = SECONDS) -> tuple[np.ndarray, int]:
+                       url_encoded: bool = True, seconds: int = SECONDS,
+                       notes: dict | None = None) -> tuple[np.ndarray, int]:
     """Mayo FACT_ECG_WAVEFORM rows of one acquisition (WAVEFORM_TYPE = Rhythm; leads I, II,
     V1-V6) -> ((12, n) mV, sampling rate).
 
-    MCP: records are not ordered pieces of one recording, so they are never concatenated. When a
-    lead has more than one record, the one holding exactly `seconds` of signal is used; otherwise
-    the ECG is skipped (AmbiguousECG). Without a sampling rate, it is inferred from the length
+    MCP (Tommy Stretch, 5 Nov 2026): typically one rhythm record per lead. When a lead has several
+    and each already holds the full 2,500 / 5,000 samples, they are complete waveforms, not pieces
+    to combine: one is used (the first in a fixed order, so reruns agree) and `notes` counts it.
+    Several partial records could be pieces of one recording, but nothing gives their order, so
+    that ECG is skipped (AmbiguousECG). Without a sampling rate, it is inferred from the length
     (2,500 samples = 250 Hz, 5,000 = 500 Hz for 10 s)."""
     per: dict[str, list[np.ndarray]] = {}
     for l, p in zip(lead_ids, payloads):
@@ -143,10 +146,12 @@ def leads_from_records(lead_ids, payloads, fs: int | None = None, units_per_bit:
         if len(arrs) == 1:
             a = arrs[0]
         else:
-            full = [a for a in arrs if len(a) == fs * seconds]
-            if len(full) != 1:
-                raise AmbiguousECG(f"lead {l}: {len(arrs)} records, {len(full)} of full length")
+            full = sorted((a for a in arrs if len(a) == fs * seconds), key=lambda v: v.tobytes())
+            if not full:
+                raise AmbiguousECG(f"lead {l}: {len(arrs)} partial records, order unknown")
             a = full[0]
+            if notes is not None and len(full) > 1:
+                notes["several_complete"] = True
         leads[l] = a.astype(np.float64) * units_per_bit / 1000.0          # counts -> microvolts -> mV
     return _assemble(leads), fs
 
