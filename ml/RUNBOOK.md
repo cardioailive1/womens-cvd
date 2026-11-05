@@ -102,6 +102,16 @@ Everyone who audits needs a workspace account and DUA, and is listed by user nam
 - **Pre-training:** three stages: ECG, echo and labs.
 - **Total size:** about 52M parameters, in line with the form.
 
+**What MCP confirmed (5 Nov 2026, Tommy Stretch and Adam Resnick):**
+- **ECG rhythm records:** usually one per lead. If a lead has several and each already holds the full 2,500 / 5,000 samples, they are complete waveforms: one is used, and report 00 counts it. Several partial records could be pieces, but nothing gives their order, so that ECG is skipped and counted.
+- **`ECGSAMPLEBASE`:** comes from `FACT_ECG_WAVEFORM_RESTING_MEASUREMENT`, joined on `PATIENT_DK` + `ACQUISITION_TS`. The record length is the fallback.
+- **ECG interpretations from MUSE are cardiologist-signed.** For heart rate, use `FACT_ECG.HEART_RATE`, the clinician-validated value.
+- **The de-identification CSV takes `PATIENT_DK` from `DIM_PATIENT`** via `PATIENT_CLINIC_NUMBER` with `PATIENT_MERGED_FLAG = 'N'`. This is confirmed; `patient_dk_source: dim_patient`.
+- **Which study descriptions count as transthoracic echo is our decision.** Use the Term Finder in `My_First_Query.ipynb` (`/data/intro/Introduction_Notebooks/Accelerate`) together with report `00_dicom_descriptions` (selected studies per description, small-cell suppressed), then adjust `description_pattern` / `description_exclude`.
+- **`DIM_ECHO_TEST` is a lookup of test types only.** It can't match a patient's exam to a DICOM study by itself; matching on days with several echos is still open with Adam.
+- **Which LVEF result names to prefer is our decision.** All LVEF types stay visible to reviewers, each labelled with its name.
+- **Dataset and project names for the BigQuery client** are in `My_First_Query.ipynb`, and MCP will send them by email. The OMOP `concept` table is in BigQuery, and ATLAS training is planned for concept search.
+
 **House rules on the platform:** row-level data never leaves the workbench, and nothing outside it may be imported or mixed with it. Only files in the `reports/` folders, which are already small-cell suppressed, and the final model bundle are requested for export.
 
 In this runbook, `$WB` stands for your workspace's persistent folder (for example `/workbench`). Replace it with the real path.

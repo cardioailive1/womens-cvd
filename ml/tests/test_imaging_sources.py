@@ -69,6 +69,7 @@ def test_dicom_request_list(db, tmp_path):
     db.execute("CREATE OR REPLACE TABLE mcp.FACT_RADIOLOGY AS SELECT * FROM rad_df")
 
     cfg = cfg_for(tmp_path)                                    # shipped config, nothing overridden
+    cfg.dicom_inventory["patient_dk_source"] = "inventory"     # this test's inventory carries PATIENT_DK
     req = build_dicom_request(DuckDBBackend(db), cfg, tmp_path / "req.csv")
     kinds = set(req.study_uid.str.split(".").str[0])
     assert kinds == {"NEAR", "NODATE"}
@@ -168,6 +169,8 @@ def test_extract_mayo_fact_ecg_waveform(db, tmp_path):
     rows += [(7003, "2020-05-05 09:00:00", l, "Rhythm", enc(sig(1200, 3))) for l in LEADS8]  # two partial
     rows += [(7003, "2020-05-05 09:00:00", l, "Rhythm", enc(sig(1300, 3))) for l in LEADS8]  # records: skip
     rows.append((7002, "2020-06-06 08:00:00", "I", "Rhythm", "%%%not-base64"))  # unreadable
+    # Tommy Stretch (5 Nov): two complete records for the same lead = complete waveforms -> one used
+    rows += [(7000, "2020-07-07 09:00:00", l, "Rhythm", enc(sig(5000, j))) for l in LEADS8 for j in (0, 5)]
     db.register("w_df", pd.DataFrame(rows, columns=["PATIENT_DK", "ACQUISITION_TS", "LEAD_ID", "WAVEFORM_TYPE", "WAVEFORM"]))
     db.register("d_df", pd.DataFrame(dims, columns=["PATIENT_DK", "PATIENT_CLINIC_NUMBER", "PATIENT_MERGED_FLAG"]))
     db.register("m_df", pd.DataFrame(meas, columns=["PATIENT_DK", "ACQUISITION_TS", "ECGSAMPLEBASE"]))
@@ -181,14 +184,15 @@ def test_extract_mayo_fact_ecg_waveform(db, tmp_path):
                          sample_rate_keys=["PATIENT_DK", "ACQUISITION_TS"])
     cfg.dim_patient.update(table="dim_patient")
     man = extract_ecg_table(DuckDBBackend(db), cfg, tmp_path / "ecg", person_ids=people.person_id.tolist())
-    assert len(man) == 4                                   # 4 women; the second-system copy is not double-counted
-    assert sorted(man.fs.tolist()) == [250, 500, 500, 500]
+    assert len(man) == 5                                   # 4 women + a second ECG with two complete records per lead;
+    assert sorted(man.fs.tolist()) == [250, 500, 500, 500, 500]   # the second-system copy is not double-counted
     for p in man.path:
         x = load_ecg(p, "npy_dir")
         assert x.shape == (12, N_SAMPLES) and np.isfinite(x).all()
     raw = np.load(man.path.iloc[0]); assert raw["x"].shape[0] == 12
     rep = pd.read_csv(tmp_path / "rep" / "00_ecg_extraction.csv").set_index("item")
-    assert "ECGs skipped: several records per lead, none the full 10 s" in rep.index
+    assert "ECGs skipped: a lead with only partial records (order unknown)" in rep.index
+    assert "ECGs with a lead holding several complete records (one used)" in rep.index
     v = np.array([-3, 0, 32767, -32768], dtype="<i2")
     assert (decode_waveform(enc(v)) == v).all()                                # URL + Base64 round trip
 
@@ -216,7 +220,7 @@ def test_submission_takes_patient_dk_from_dim_patient(db, tmp_path):
     db.register("dim2", pd.DataFrame(dims, columns=["PATIENT_DK", "PATIENT_CLINIC_NUMBER", "PATIENT_MERGED_FLAG"]))
     db.execute("CREATE OR REPLACE TABLE dim_pat2 AS SELECT * FROM dim2")
     cfg = cfg_for(tmp_path)
-    assert cfg.dicom_inventory["patient_dk_source"] == "auto"
+    assert cfg.dicom_inventory["patient_dk_source"] == "dim_patient"     # confirmed by MCP, 5 Nov
     cfg.dicom_inventory.update(table="inv_nodk", date_source="none", accession_column=None)
     cfg.dim_patient.update(table="dim_pat2")
     keep = people.person_id.tolist()[:4]
@@ -229,6 +233,8 @@ def test_submission_takes_patient_dk_from_dim_patient(db, tmp_path):
     assert set(sub.PATIENT_DK) == {700000 + first} | {900000 + p for p in keep[1:]}   # lowest current DK
     rep = pd.read_csv(tmp_path / "rep" / "00_dicom_request.csv").set_index("item")
     assert "PATIENT_DK taken from: dim_patient" in rep.index
+    desc = pd.read_csv(tmp_path / "rep" / "00_dicom_descriptions.csv")
+    assert list(desc.columns) == ["description", "n_studies", "n_women"] and "TTE ECHO COMPLETE" in set(desc.description)
     cfg.dicom_inventory["patient_dk_source"] = "bogus"
     with pytest.raises(ValueError, match="patient_dk_source"):
         build_dicom_request(DuckDBBackend(db), cfg, tmp_path / "r2.csv")
@@ -245,14 +251,19 @@ def test_extract_ecg_by_clinic_number_resting_only(db, tmp_path):
     for k, r in enumerate(people.itertuples()):
         n = 2500 if k == 0 else 5000
         for l in LEADS8:
-            rows.append((r.person_source_value, "2020-03-01 10:00:00", l, "rhythm", "resting", enc(sig(n))))
-            rows.append((r.person_source_value, "2020-03-01 10:00:00", l, "median", "resting", enc(sig(600))))
+            rows.append((r.person_source_value, 8000 + k, "2020-03-01 10:00:00", l, "rhythm", "resting", enc(sig(n))))
+            rows.append((r.person_source_value, 8000 + k, "2020-03-01 10:00:00", l, "median", "resting", enc(sig(600))))
             if k == 2:   # a stress ECG for the third woman: not a resting ECG, never used
-                rows.append((r.person_source_value, "2020-04-01 10:00:00", l, "rhythm", "stress", enc(sig(5000))))
+                rows.append((r.person_source_value, 8000 + k, "2020-04-01 10:00:00", l, "rhythm", "stress", enc(sig(5000))))
     db.execute("CREATE SCHEMA IF NOT EXISTS mcp")
-    db.register("w3", pd.DataFrame(rows, columns=["PATIENT_CLINIC_NUMBER", "ACQUISITION_TS", "LEAD_ID",
+    db.register("w3", pd.DataFrame(rows, columns=["PATIENT_CLINIC_NUMBER", "PATIENT_DK", "ACQUISITION_TS", "LEAD_ID",
                                                   "WAVEFORM_TYPE", "EKG_TYPE", "WAVEFORM"]))
     db.execute("CREATE OR REPLACE TABLE mcp.FACT_ECG_WAVEFORM AS SELECT * FROM w3")
+    # ECGSAMPLEBASE joins on PATIENT_DK + ACQUISITION_TS (Tommy Stretch, 5 Nov); the third ECG has no
+    # measurement row, so its rate comes from the record length
+    db.register("m3", pd.DataFrame([(8000, "2020-03-01 10:00:00", 250), (8001, "2020-03-01 10:00:00", 500)],
+                                   columns=["PATIENT_DK", "ACQUISITION_TS", "ECGSAMPLEBASE"]))
+    db.execute("CREATE OR REPLACE TABLE mcp.FACT_ECG_WAVEFORM_RESTING_MEASUREMENT AS SELECT * FROM m3")
     cfg = cfg_for(tmp_path)                                     # shipped config, nothing overridden
     man = extract_ecg_table(DuckDBBackend(db), cfg, tmp_path / "ecg", person_ids=people.person_id.tolist())
     assert len(man) == 3 and set(man.record_date.astype(str)) == {"2020-03-01"}
