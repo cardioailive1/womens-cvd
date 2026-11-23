@@ -416,7 +416,11 @@ Goal: check the automatic condition labels against the records before training o
 
    The screen shows the automatic label and the question (for example "Spontaneous coronary artery dissection, not iatrogenic or traumatic?"). Answer **Agree**, **Disagree** (the label is flipped) or **Uncertain**, with a short note whenever you disagree or are unsure.
    **Assisted review (`audit.auto_tier1: "assisted"`, the configured default).**
-   - **Every item goes to the data scientists** with the automatic audit's recommendation:
+   - **Which items the data scientists see** is set by `audit.ds_review`:
+     - `uncertain` (the default): only the items the automatic audit marked uncertain. Items it agreed with count as accepted, with the blind automatic spot-check (`auto_spot_check_fraction`). Items it proposed to correct go straight to the cardiologist with that recommendation.
+     - `flagged`: the uncertain items plus the proposed corrections.
+     - `all`: every item.
+   - **Each item the data scientists see comes** with the automatic audit's recommendation:
      - **KEEP** the automatic label;
      - **CORRECT** it (with the proposed label);
      - **UNCONFIRMED**, when the audit could not check it.
