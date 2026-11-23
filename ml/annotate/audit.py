@@ -19,8 +19,10 @@ How the automatic verdicts route items (`auto_tier1`):
              the ones it disagrees with or is unsure about go to the data scientists, whose
              answer decides.
   replace  — the auditor is tier 1; its disagreements and uncertain items go straight to tier 2.
-  assisted — every item goes to the data scientists with the automatic audit's recommendation
-             (keep the label, a proposed correction, or "unconfirmed" when it could not check):
+  assisted — the data scientists get the items set by `ds_review` (default "uncertain": only
+             the items the automatic audit could not check; items it agreed with count as accepted
+             and items it proposed to correct go straight to the cardiologist), each with the
+             automatic recommendation (keep the label, a proposed correction, or "unconfirmed"):
              they ACCEPT or REJECT it, then each signs off (`sign_off(ds, tier=1)`). Tier 2 opens
              only after every data scientist who answered has signed off. The cardiologist sees the
              same automatic recommendation on the disagreements and uncertain items and accepts or
@@ -58,6 +60,7 @@ VERDICTS = ("agree", "disagree", "uncertain")
 AUTO_MODES = ("triage", "replace", "assisted")  # the automatic audit is required; there is no "off"
 DECISIONS = ("accept", "reject", "uncertain")    # assisted review: on the automatic recommendation
 SIGNOFF_ITEM = "__audit__"
+DS_REVIEW = ("uncertain", "flagged", "all")       # assisted: which automatic verdicts reach the data scientists
 AUTO_AUDITOR, AUTO_SOURCE = "auto-audit", "auto:audit"
 ECHO_TASK = "echo"
 FRAME_TOLERANCE = 2          # ED / ES within this many frames count as the same
@@ -131,6 +134,11 @@ class LabelAudit:
     auto_tier1: str = "triage"                # triage | replace (the automatic audit is required)
     auto_spot_check_fraction: float = 0.20    # of auto-accepted items
     blind_spot_check: bool = True             # assisted: spot-check items reach the cardiologist blind
+    ds_review: str = "uncertain"              # assisted: which items the data scientists review:
+                                              #   uncertain - only automatic "uncertain"; "agree" counts as
+                                              #               accepted, "disagree" goes to the cardiologist
+                                              #   flagged   - uncertain + disagree; "agree" counts as accepted
+                                              #   all       - every item
     _key: pd.Index = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -141,6 +149,8 @@ class LabelAudit:
             raise ValueError(f"{sorted(overlap)} listed as both data scientist and cardiologist")
         if self.auto_tier1 not in AUTO_MODES:
             raise ValueError(f"the automatic audit is required: auto_tier1 must be one of {AUTO_MODES}")
+        if self.ds_review not in DS_REVIEW:
+            raise ValueError(f"ds_review must be one of {DS_REVIEW}")
         if AUTO_AUDITOR in set(self.data_scientists) | set(self.cardiologists):
             raise ValueError(f"{AUTO_AUDITOR!r} is reserved for the automatic auditor")
         self.items = self.items.drop_duplicates(["item_id", "task"]).reset_index(drop=True)
@@ -157,7 +167,8 @@ class LabelAudit:
                    tier1_per_item=int(a.get("tier1_per_item", 1)), seed=cfg.seed,
                    auto_tier1=str(a.get("auto_tier1", "triage") or "triage"),
                    auto_spot_check_fraction=float(a.get("auto_spot_check_fraction", 0.20)),
-                   blind_spot_check=bool(a.get("blind_spot_check", True)))
+                   blind_spot_check=bool(a.get("blind_spot_check", True)),
+                   ds_review=str(a.get("ds_review", "uncertain") or "uncertain"))
 
     # ---- raw reads
     def _tier(self, tier: int, auto: bool = False) -> pd.DataFrame:
@@ -203,6 +214,9 @@ class LabelAudit:
                 rows, done, by = (aut if hum.empty else g), True, "auto" if hum.empty else "human"
             elif self.auto_tier1 == "triage" and len(aut) and hum.empty and (aut.verdict == "agree").all():
                 rows, done, by = aut, True, "auto"
+            elif (self.auto_tier1 == "assisted" and len(aut) and hum.empty
+                  and set(aut.verdict) <= self._auto_routed()):
+                rows, done, by = aut, True, "auto"           # not sent to the data scientists (ds_review)
             else:                                            # people decide (auto verdict is a hint)
                 rows, done, by = hum, len(hum) >= self.tier1_per_item, "human"
             out[key] = (rows, done, by)
@@ -317,6 +331,10 @@ class LabelAudit:
         if ((t1.item_id == str(item_id)) & (t1.task == task) & (t1.annotator == annotator)).any():
             raise PermissionError("an item cannot be adjudicated by someone who audited it at tier 1")
         self.store.add_human(str(item_id), f"audit2:{task}", value, annotator, note)
+
+    def _auto_routed(self) -> set:
+        """Automatic verdicts that, in assisted mode, are settled without the data scientists."""
+        return {"uncertain": {"agree", "disagree"}, "flagged": {"agree"}, "all": set()}[self.ds_review]
 
     # ---- assisted review: accept or reject the automatic recommendation, then sign off
     def recommendation(self, item_id, task: str, _av: pd.DataFrame | None = None) -> dict:

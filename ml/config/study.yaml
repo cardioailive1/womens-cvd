@@ -201,6 +201,11 @@ audit:
   # Start with triage or assisted; use replace only after the auto row of report 09d passes its spot-check.
   auto_tier1: "assisted"
   blind_spot_check: true           # assisted: spot-check items reach the cardiologist without a recommendation
+  # assisted: which items the data scientists review
+  #   uncertain - only those the automatic audit marked uncertain; "agree" items count as accepted
+  #               (with the auto spot-check), "disagree" items go straight to the cardiologist
+  #   flagged   - uncertain + disagree      all - every item
+  ds_review: uncertain
   auto_spot_check_fraction: 0.20   # share of auto-accepted items re-labelled blind (at least spot_check_min)
 
 training:
