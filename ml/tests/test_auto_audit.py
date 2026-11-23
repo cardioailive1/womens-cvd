@@ -171,7 +171,7 @@ def test_mode_and_reserved_name(tmp_path):
     cfg = StudyConfig.load(Path(__file__).resolve().parents[1] / "config/study.yaml")
     cfg.audit.update(data_scientists=["ds_ana"], cardiologists=["dr_cole"])
     a = LabelAudit.from_config(items, AnnotationStore(tmp_path / "a.csv"), cfg)
-    assert a.auto_tier1 == "triage" and a.auto_spot_check_fraction == 0.20
+    assert a.auto_tier1 == "assisted" and a.auto_spot_check_fraction == 0.20
     cfg.audit["auto_tier1"] = "triage"
     assert LabelAudit.from_config(items, AnnotationStore(tmp_path / "b.csv"), cfg).auto_tier1 == "triage"
 
