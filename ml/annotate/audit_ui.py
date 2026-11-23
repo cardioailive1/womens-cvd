@@ -13,7 +13,14 @@ Tier 2, cardiologist — the same screen with tier=2. No automatic or data-scien
 and disagreements, uncertain items and spot-checks are shuffled together, so the cardiologist
 labels every item independently.
 
-Logic lives in plain methods (current, submit, skip); show() only wires them to widgets.
+Assisted review (audit.auto_tier1 = "assisted"): each item shows the automatic audit's
+recommendation (keep the label, a proposed correction, or unconfirmed). Press Accept or Reject
+(for echo, set your own view and frames before Reject), or Uncertain. When the queue is empty,
+press "Sign off my review". The cardiologist's screen opens only after every data scientist has
+signed off; it shows the same recommendation on escalated items, while spot-check items stay
+blind, and ends with the cardiologist's sign-off.
+
+Logic lives in plain methods (current, submit, skip, sign_off); show() only wires them to widgets.
 """
 from __future__ import annotations
 
@@ -46,9 +53,19 @@ class AuditScreen:
             self.paths = pd.read_csv(Path(echo_cache) / "index.csv").set_index("item_id").path.to_dict()
         self.refresh()
 
+    @property
+    def assisted(self) -> bool:
+        return self.audit.auto_tier1 == "assisted"
+
     def refresh(self):
-        self.queue = (self.audit.tier1_queue(self.annotator) if self.tier == 1
-                      else self.audit.tier2_queue(self.annotator)[["item_id", "task"]])
+        self._reason = {}
+        if self.tier == 1:
+            self.queue = self.audit.tier1_queue(self.annotator)
+        else:
+            q = self.audit.tier2_queue(self.annotator)
+            self._reason = {(r.item_id, r.task): r.reason for r in q.itertuples()}   # never shown
+            self.queue = q[["item_id", "task"]]
+        self._av = self.audit.auto_verdicts() if self.assisted else None
         self.pos = 0
         self._clip = None
         self._auto_audit = {}
@@ -72,6 +89,11 @@ class AuditScreen:
             av = self._auto_audit.get((r.item_id, r.task))
             if av is not None:
                 item["auto_audit"] = av
+            if self.assisted:
+                item["recommendation"] = self.audit.recommendation(r.item_id, r.task, _av=self._av)
+        elif self.assisted and not (self.audit.blind_spot_check
+                                    and self._reason.get((r.item_id, r.task)) == "spot-check"):
+            item["recommendation"] = self.audit.recommendation(r.item_id, r.task, _av=self._av)
         if item["kind"] == "echo":
             if self._clip is None or self._clip[0] != r.item_id:
                 frames, _ = read_clip(self.paths[r.item_id])
@@ -86,14 +108,24 @@ class AuditScreen:
         return item
 
     def submit(self, *, verdict: str | None = None, value=None, view=None, ed=None, es=None,
-               note: str | None = None) -> None:
+               note: str | None = None, decision: str | None = None) -> None:
         """Tier 1: verdict = agree | disagree | uncertain (disagree on echo needs view/ed/es).
-        Tier 2: value = yes | no | unsure for conditions, or view (+ ed, es) for echo."""
+        Tier 2: value = yes | no | unsure for conditions, or view (+ ed, es) for echo.
+        Assisted items: decision = accept | reject | uncertain on the recommendation (rejecting an
+        echo recommendation needs view/ed/es)."""
         c = self.current()
         if c is None:
             return
         if c["kind"] == "echo" and (view is not None):
             value = echo_value(view, ed, es) if view in VIEWS[:4] else echo_value(view)
+        if decision is not None:
+            if "recommendation" not in c:
+                raise ValueError("this item has no recommendation; give your own label")
+            fn = self.audit.submit_tier1_decision if self.tier == 1 else self.audit.submit_tier2_decision
+            fn(c["item_id"], c["task"], decision, self.annotator,
+               value=value if decision == "reject" else None, note=note)
+            self.pos += 1
+            return
         if self.tier == 1:
             self.audit.submit_tier1(c["item_id"], c["task"], verdict, self.annotator, value=value, note=note)
         else:
@@ -104,6 +136,10 @@ class AuditScreen:
 
     def skip(self) -> None:
         self.pos += 1
+
+    def sign_off(self, note: str | None = None) -> None:
+        """Sign off this reviewer's tier once their queue is finished."""
+        self.audit.sign_off(self.annotator, self.tier, note)
 
     # ---- widgets
     def show(self):
@@ -125,6 +161,10 @@ class AuditScreen:
         b_no = W.Button(description="No", button_style="danger")
         b_uns = W.Button(description="Unsure")
         b_save = W.Button(description="Save and next", button_style="primary")
+        b_acc = W.Button(description="Accept recommendation", button_style="success", layout=W.Layout(width="auto"))
+        b_rej = W.Button(description="Reject recommendation", button_style="danger", layout=W.Layout(width="auto"))
+        b_runc = W.Button(description="Uncertain")
+        b_sign = W.Button(description="Sign off my review", button_style="primary", layout=W.Layout(width="auto"))
         b_skip = W.Button(description="Skip")
         box = W.VBox()
         st = {}
@@ -140,14 +180,22 @@ class AuditScreen:
             c = self.current()
             st.clear()
             if c is None:
-                head.value = "<b>Queue empty.</b>"; box.children = [head]; return
+                head.value = "<b>Queue empty.</b>"
+                box.children = [head, b_sign, msg] if self.assisted else [head]
+                return
             st.update(c)
             tier_txt = ("Tier 1 audit: check the automatic label" if self.tier == 1
                         else "Tier 2: give your own label (no other labels are shown)")
             head.value = f"<b>{self.remaining()} left</b> · {tier_txt}"
             note.value = ""; msg.value = ""
             hint = ""
-            if c.get("auto_audit"):
+            rec = c.get("recommendation")
+            if rec is not None:
+                what = {"keep": "KEEP the automatic label", "correct": "CORRECT the label",
+                        "unconfirmed": "UNCONFIRMED: the automatic audit could not check this label"}[rec["kind"]]
+                hint = (f"<p style='background:#e0f2fe;padding:4px 8px'>Recommendation: <b>{what}</b> — proposed: "
+                        f"<b>{html.escape(str(rec['proposed']))}</b><br>{html.escape(str(rec['note'] or ''))}</p>")
+            elif c.get("auto_audit"):
                 a = c["auto_audit"]
                 hint = (f"<p style='background:#fef3c7;padding:4px 8px'>Automatic audit: "
                         f"<b>{html.escape(str(a['verdict']))}</b> — {html.escape(str(a['note'] or ''))}</p>")
@@ -157,7 +205,8 @@ class AuditScreen:
                     shown = (f"<p style='font-size:15px'><b>Automatic label: {html.escape(str(c['auto_value']).upper())}</b>"
                              f" — {html.escape(c['question'])}</p>") + shown
                 body.value = hint + shown
-                btns = [b_agree, b_dis, b_unc] if self.tier == 1 else [b_yes, b_no, b_uns]
+                btns = ([b_acc, b_rej, b_runc] if rec is not None else
+                        [b_agree, b_dis, b_unc] if self.tier == 1 else [b_yes, b_no, b_uns])
                 box.children = [head, body, note, W.HBox(btns + [b_skip]), msg]
             else:
                 v = json.loads(c["auto_value"]) if self.tier == 1 else {"view": None, "ed": None, "es": None}
@@ -169,7 +218,13 @@ class AuditScreen:
                 ed.value, es.value = v["ed"] or 0, v["es"] or 0
                 frame.max = len(c["frames"]) - 1; frame.value = ed.value
                 draw()
-                btns = [b_agree, b_dis, b_unc] if self.tier == 1 else [b_save]
+                if rec is not None and rec["proposed"]:          # start from the proposal
+                    pv = json.loads(rec["proposed"])
+                    view.value = pv["view"] if pv["view"] in HUMAN_VIEWS else None
+                    ed.value, es.value = pv.get("ed") or 0, pv.get("es") or 0
+                    draw()
+                btns = ([b_acc, b_rej, b_runc] if rec is not None else
+                        [b_agree, b_dis, b_unc] if self.tier == 1 else [b_save])
                 box.children = [head, body, img, frame, sig, view, W.HBox([ed, set_ed]), W.HBox([es, set_es]),
                                 note, W.HBox(btns + [b_skip]), msg]
 
@@ -190,6 +245,16 @@ class AuditScreen:
         b_save.on_click(lambda _: act(**echo_kw()) if view.value else
                         setattr(msg, "value", "<span style='color:#b91c1c'>Choose a view first.</span>"))
         b_skip.on_click(lambda _: (self.skip(), load()))
+        b_acc.on_click(lambda _: act(decision="accept"))
+        b_runc.on_click(lambda _: act(decision="uncertain"))
+        b_rej.on_click(lambda _: act(decision="reject", **(echo_kw() if st.get("kind") == "echo" else {})))
+
+        def sign(_):
+            try:
+                self.sign_off(); msg.value = "<b>Signed off.</b> Thank you."
+            except (RuntimeError, PermissionError) as e:
+                msg.value = f"<span style='color:#b91c1c'>{html.escape(str(e))}</span>"
+        b_sign.on_click(sign)
         frame.observe(draw, "value"); ed.observe(draw, "value"); es.observe(draw, "value")
         set_ed.on_click(lambda _: setattr(ed, "value", frame.value))
         set_es.on_click(lambda _: setattr(es, "value", frame.value))

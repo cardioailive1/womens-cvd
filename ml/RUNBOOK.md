@@ -294,12 +294,13 @@ The tool is built into the repository (`ml/annotate/`) and runs in JupyterLab; i
    AuditScreen(audit, "<cardiologist user>", tier=2, echo_cache=f"{WB}/annot/cache").show()
    ```
 
-   At tier 1 the screen shows the automatic view and frames: **Agree** if right; otherwise set the right view and frames and press **Disagree**, or press **Uncertain**. At tier 2 the cardiologist sees no earlier labels and labels each clip from scratch. The queue mixes every disagreement, every uncertain clip and a random 10% (at least 20) of the clips tier 1 accepted, in random order. When tier 2 is done, write the audited labels back so `finalize` uses them, and save the audit report:
+   In assisted mode (the default) each clip shows the automatic audit's recommendation, with the proposed view and frames already set. **Accept** or **Reject** it (adjust the view and frames before Reject), then sign off when the queue is empty; the cardiologist does the same on escalated clips and signs off before `apply_to_echo_store`. Otherwise, at tier 1 the screen shows the automatic view and frames: **Agree** if right; otherwise set the right view and frames and press **Disagree**, or press **Uncertain**. At tier 2 the cardiologist sees no earlier labels and labels each clip from scratch. The queue mixes every disagreement, every uncertain clip and a random 10% (at least 20) of the clips tier 1 accepted, in random order. When tier 2 is done, write the audited labels back so `finalize` uses them, and save the audit report:
 
    ```python
    apply_to_echo_store(audit, echo_store)
    write_report(audit.report(cfg.min_cell_size, cfg.audit["spot_check_target"]), "09d_echo_label_audit", cfg.report_dir)
    write_report(audit.auto_calibration(cfg.min_cell_size), "09e_echo_auto_audit", cfg.report_dir)   # if auto tier 1 was used
+   write_report(audit.assist_report(cfg.min_cell_size), "09f_echo_assisted_review", cfg.report_dir)   # assisted mode
    ```
 
    For the check model, train a second view model after the review round (`python -m annotate.echo train-views ... --out $WB/annot/view_model_check.pt`); without one, clips whose view came only from the labelling model are marked uncertain and go to a person. If there are too many clips to audit them all, pass `echo_audit_items(echo_store, sample=5000)` to audit a random sample instead; say so in the study report.
@@ -414,7 +415,20 @@ Goal: check the automatic condition labels against the records before training o
    With `triage`, each data scientist's queue holds only the records the automatic auditor flagged, flagged ones first, with its finding (for example "against: cath/PCI 1 day(s) before the dissection code") shown above the record. With `replace` the queue is empty and you go straight to step 3. The automatic auditor needs notes to work from: a record with no notes in the window is always marked uncertain, so if the platform exposes few notes, most records still reach a person.
 
    The screen shows the automatic label and the question (for example "Spontaneous coronary artery dissection, not iatrogenic or traumatic?"). Answer **Agree**, **Disagree** (the label is flipped) or **Uncertain**, with a short note whenever you disagree or are unsure.
-3. **Tier 2, cardiologist, blinded.** When tier 1 is finished:
+   **Assisted review (`audit.auto_tier1: "assisted"`, the configured default).**
+   - **Every item goes to the data scientists** with the automatic audit's recommendation:
+     - **KEEP** the automatic label;
+     - **CORRECT** it (with the proposed label);
+     - **UNCONFIRMED**, when the audit could not check it.
+   - **Each item is one click:** **Accept recommendation** or **Reject recommendation** (for echo, set your own view and frames first), or **Uncertain**, with a note when you reject or are unsure.
+   - **When their queue is empty, each data scientist signs off** with **Sign off my review**, or `audit.sign_off("<ds user>", tier=1)`.
+   - **The cardiologist tier refuses to open until** tier 1 is complete and every data scientist who answered has signed off.
+
+   ```python
+   audit.signoff_status()          # who has answered and signed off
+   ```
+
+3. **Tier 2, cardiologist.** When tier 1 is finished (and, in assisted mode, signed off). In assisted mode the cardiologist sees the same automatic recommendation on the disagreements and uncertain items, and accepts or rejects it, or answers Unsure. Spot-check items stay blind (`blind_spot_check: true`): they show no recommendation and are labelled Yes / No / Unsure, so the spot-check still measures how many errors tier 1 lets through. When the queue is empty, the cardiologist signs off (**Sign off my review**, or `audit.sign_off("<cardiologist user>", tier=2)`). `apply_to_labels` and `apply_to_echo_store` refuse to run before that sign-off. In the other modes:
 
    ```python
    AuditScreen(audit, "<cardiologist user>", tier=2, phenotype_context=f"{WB}/annot/context.pkl").show()
@@ -429,6 +443,7 @@ Goal: check the automatic condition labels against the records before training o
    write_report(audit.report(cfg.min_cell_size, cfg.audit["spot_check_target"]), "09d_phenotype_label_audit", cfg.report_dir)
    write_report(phenotype_validation(audit, s, cfg.min_cell_size), "09c_phenotype_validation", cfg.report_dir)
    write_report(audit.auto_calibration(cfg.min_cell_size), "09e_phenotype_auto_audit", cfg.report_dir)   # if auto tier 1 was used
+   write_report(audit.assist_report(cfg.min_cell_size), "09f_phenotype_assisted_review", cfg.report_dir)  # assisted mode: accept / reject rates
    labels = pd.read_pickle(f"{WB}/hcman_study/labels.pkl")
    labels.to_pickle(f"{WB}/hcman_study/labels_automatic.pkl")          # keep the original
    new, changed = apply_to_labels(audit, labels)

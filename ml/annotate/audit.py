@@ -19,6 +19,14 @@ How the automatic verdicts route items (`auto_tier1`):
              the ones it disagrees with or is unsure about go to the data scientists, whose
              answer decides.
   replace  — the auditor is tier 1; its disagreements and uncertain items go straight to tier 2.
+  assisted — every item goes to the data scientists with the automatic audit's recommendation
+             (keep the label, a proposed correction, or "unconfirmed" when it could not check):
+             they ACCEPT or REJECT it, then each signs off (`sign_off(ds, tier=1)`). Tier 2 opens
+             only after every data scientist who answered has signed off. The cardiologist sees the
+             same automatic recommendation on the disagreements and uncertain items and accepts or
+             rejects it; spot-check items stay blind (`blind_spot_check`, default on) so the
+             spot-check still measures tier 1 independently. The cardiologist then signs off
+             (`sign_off(cardiologist, tier=2)`), and only then can the final labels be applied.
 The spot-check samples auto-accepted and human-accepted items separately
 (`auto_spot_check_fraction` / `spot_check_fraction`, each at least `spot_check_min`), so the
 report shows how many wrong labels each route lets through.
@@ -47,7 +55,9 @@ from .phenotype import task_name, wilson
 from .store import AnnotationStore
 
 VERDICTS = ("agree", "disagree", "uncertain")
-AUTO_MODES = ("triage", "replace")             # the automatic audit is required; there is no "off"
+AUTO_MODES = ("triage", "replace", "assisted")  # the automatic audit is required; there is no "off"
+DECISIONS = ("accept", "reject", "uncertain")    # assisted review: on the automatic recommendation
+SIGNOFF_ITEM = "__audit__"
 AUTO_AUDITOR, AUTO_SOURCE = "auto-audit", "auto:audit"
 ECHO_TASK = "echo"
 FRAME_TOLERANCE = 2          # ED / ES within this many frames count as the same
@@ -120,6 +130,7 @@ class LabelAudit:
     seed: int = 0
     auto_tier1: str = "triage"                # triage | replace (the automatic audit is required)
     auto_spot_check_fraction: float = 0.20    # of auto-accepted items
+    blind_spot_check: bool = True             # assisted: spot-check items reach the cardiologist blind
     _key: pd.Index = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -145,7 +156,8 @@ class LabelAudit:
                    spot_check_min=int(a.get("spot_check_min", 20)),
                    tier1_per_item=int(a.get("tier1_per_item", 1)), seed=cfg.seed,
                    auto_tier1=str(a.get("auto_tier1", "triage") or "triage"),
-                   auto_spot_check_fraction=float(a.get("auto_spot_check_fraction", 0.20)))
+                   auto_spot_check_fraction=float(a.get("auto_spot_check_fraction", 0.20)),
+                   blind_spot_check=bool(a.get("blind_spot_check", True)))
 
     # ---- raw reads
     def _tier(self, tier: int, auto: bool = False) -> pd.DataFrame:
@@ -158,6 +170,7 @@ class LabelAudit:
             parsed = df.value.map(json.loads)
             df["verdict"] = parsed.map(lambda v: v["verdict"])
             df["corrected"] = parsed.map(lambda v: v.get("value"))
+            df["decision"] = parsed.map(lambda v: v.get("rec"))             # assisted review only
         # one answer per reviewer per item: their latest
         return df.sort_values("ts", kind="stable").groupby(["item_id", "task", "annotator"]).tail(1)
 
@@ -222,7 +235,7 @@ class LabelAudit:
         """Items in the audit set that the automatic audit has not given a verdict yet."""
         av = self.auto_verdicts()
         done = set(zip(av.item_id, av.task))
-        return self.items[[(i, t) not in done for i, t in zip(self.items.item_id, self.items.task)]]
+        return self.items[np.array([(i, t) not in done for i, t in zip(self.items.item_id, self.items.task)], dtype=bool)]
 
     def _require_automatic_audit(self) -> None:
         missing = self.automatic_audit_missing()
@@ -241,9 +254,9 @@ class LabelAudit:
         eff = self._t1_effective()
         need = [(i, t) not in mine and not eff.get((i, t), (None, False))[1]
                 for i, t in zip(self.items.item_id, self.items.task)]
-        q = self.items[need]
+        q = self.items[np.array(need, dtype=bool)]
         flagged = set()
-        if self.auto_tier1 == "triage":                     # items the auditor flagged come first
+        if self.auto_tier1 in ("triage", "assisted"):       # items the auditor flagged come first
             av = self.auto_verdicts()
             flagged = set(zip(av[av.verdict != "agree"].item_id, av[av.verdict != "agree"].task))
         return q.assign(_f=[(i, t) not in flagged for i, t in zip(q.item_id, q.task)],
@@ -251,7 +264,7 @@ class LabelAudit:
                         ).sort_values(["_f", "_h"]).drop(columns=["_f", "_h"]).reset_index(drop=True)
 
     def submit_tier1(self, item_id, task: str, verdict: str, annotator: str,
-                     value=None, note: str | None = None) -> None:
+                     value=None, note: str | None = None, _extra: dict | None = None) -> None:
         if annotator not in self.data_scientists:
             raise PermissionError(f"{annotator} is not a listed data scientist (tier 1)")
         self._require_automatic_audit()
@@ -264,7 +277,7 @@ class LabelAudit:
             if value is None or same(task, value, auto):
                 raise ValueError("a disagreement needs a corrected value that differs from the automatic label")
         payload = {"verdict": verdict, "value": value if verdict == "disagree" else
-                   (auto if verdict == "agree" else None)}
+                   (auto if verdict == "agree" else None), **(_extra or {})}
         self.store.add_human(str(item_id), f"audit1:{task}", json.dumps(payload), annotator, note)
 
     # ---- tier 2
@@ -285,10 +298,11 @@ class LabelAudit:
         q = pd.DataFrame(rows, columns=["item_id", "task", "reason"])
         t2 = self._tier(2)
         done = set(zip(t2.item_id, t2.task))
-        q = q[[(i, t) not in done for i, t in zip(q.item_id, q.task)]]
+        q = q[np.array([(i, t) not in done for i, t in zip(q.item_id, q.task)], dtype=bool)]
         if annotator is not None:                            # never adjudicate your own tier-1 item
+            self._require_tier1_signed_off()
             own = set(zip(t1[t1.annotator == annotator].item_id, t1[t1.annotator == annotator].task))
-            q = q[[(i, t) not in own for i, t in zip(q.item_id, q.task)]]
+            q = q[np.array([(i, t) not in own for i, t in zip(q.item_id, q.task)], dtype=bool)]
         q = q.assign(_h=[_hash(f"t2|{i}|{t}", self.seed) for i, t in zip(q.item_id, q.task)])
         return q.sort_values("_h").drop(columns="_h").reset_index(drop=True)
 
@@ -298,10 +312,165 @@ class LabelAudit:
         if annotator not in self.cardiologists:
             raise PermissionError(f"{annotator} is not a listed cardiologist (tier 2)")
         self._require_automatic_audit()
+        self._require_tier1_signed_off()
         t1 = self._tier(1)
         if ((t1.item_id == str(item_id)) & (t1.task == task) & (t1.annotator == annotator)).any():
             raise PermissionError("an item cannot be adjudicated by someone who audited it at tier 1")
         self.store.add_human(str(item_id), f"audit2:{task}", value, annotator, note)
+
+    # ---- assisted review: accept or reject the automatic recommendation, then sign off
+    def recommendation(self, item_id, task: str, _av: pd.DataFrame | None = None) -> dict:
+        """The automatic audit's recommendation for one item: `proposed` label and `kind`
+        (keep = it agrees with the automatic label; correct = it proposes a different label;
+        unconfirmed = it could not check, so the automatic label stands unverified)."""
+        auto = self._auto(item_id, task)
+        av = self.auto_verdicts() if _av is None else _av
+        m = av[(av.item_id == str(item_id)) & (av.task == task)]
+        if m.empty:
+            raise RuntimeError(f"{item_id} / {task} has no automatic-audit verdict")
+        r = m.iloc[-1]
+        kind, proposed = {"agree": ("keep", auto), "disagree": ("correct", r.corrected)}.get(
+            r.verdict, ("unconfirmed", auto))
+        return {"proposed": proposed, "kind": kind, "verdict": r.verdict, "note": r.note,
+                "confidence": r.confidence, "auto_value": auto}
+
+    @staticmethod
+    def _decided(task: str, rec: dict, decision: str, value):
+        """The label a decision on a recommendation stands for."""
+        if decision == "accept":
+            return rec["proposed"]
+        if value is None and task != ECHO_TASK:              # binary: rejecting gives the other answer
+            value = {"yes": "no", "no": "yes"}.get(str(rec["proposed"]).lower())
+        if value is None or same(task, value, rec["proposed"]):
+            raise ValueError("rejecting a recommendation needs your own label, different from the proposed one "
+                             "(for echo: set the view and frames, then Reject)")
+        return value
+
+    def submit_tier1_decision(self, item_id, task: str, decision: str, annotator: str,
+                              value=None, note: str | None = None) -> None:
+        """Assisted tier 1: the data scientist accepts or rejects the automatic recommendation (or is
+        uncertain). Stored as an ordinary tier-1 verdict on the automatic label, plus the decision."""
+        if decision not in DECISIONS:
+            raise ValueError(f"decision must be one of {DECISIONS}")
+        rec = self.recommendation(item_id, task)
+        extra = {"rec": decision, "proposed": rec["proposed"], "kind": rec["kind"]}
+        if decision == "uncertain":
+            return self.submit_tier1(item_id, task, "uncertain", annotator, note=note, _extra=extra)
+        final = self._decided(task, rec, decision, value)
+        verdict = "agree" if same(task, final, rec["auto_value"]) else "disagree"
+        self.submit_tier1(item_id, task, verdict, annotator, value=final if verdict == "disagree" else None,
+                          note=note, _extra=extra)
+
+    def tier2_recommendation(self, item_id, task: str, reason: str) -> dict | None:
+        """What the cardiologist is shown in assisted mode: the automatic recommendation, except on
+        spot-check items while `blind_spot_check` is on (None = label it blind)."""
+        if self.auto_tier1 != "assisted" or (self.blind_spot_check and reason == "spot-check"):
+            return None
+        return self.recommendation(item_id, task)
+
+    def submit_tier2_decision(self, item_id, task: str, decision: str, annotator: str,
+                              value=None, note: str | None = None) -> None:
+        """Assisted tier 2: the cardiologist accepts or rejects the automatic recommendation, or is
+        unsure (the item stays pending). Their resulting label is final."""
+        if decision not in DECISIONS:
+            raise ValueError(f"decision must be one of {DECISIONS}")
+        rec = self.recommendation(item_id, task)
+        label = "unsure" if decision == "uncertain" else self._decided(task, rec, decision, value)
+        self.submit_tier2(item_id, task, label, annotator, note)
+        self.store.add_human(str(item_id), f"assist2:{task}",
+                             json.dumps({"rec": decision, "proposed": rec["proposed"], "kind": rec["kind"]}), annotator)
+
+    def _signoffs(self, tier: int) -> pd.DataFrame:
+        df = self.store.read().reset_index(drop=True)
+        df["_row"] = range(len(df))
+        return df[(df.item_id.astype(str) == SIGNOFF_ITEM) & (df.task == f"signoff{tier}") & (df.source == "human")]
+
+    def _answers_rows(self, tier: int) -> pd.DataFrame:
+        df = self.store.read().reset_index(drop=True)
+        df["_row"] = range(len(df))
+        return df[df.task.str.startswith(f"audit{tier}:", na=False) & (df.source == "human")]
+
+    def sign_off(self, annotator: str, tier: int, note: str | None = None) -> None:
+        """Record that a reviewer has finished and signs off their review. Tier 1: a listed data
+        scientist with nothing left in their queue. Tier 2: a listed cardiologist, after tier 1 is
+        signed off, with the adjudication queue empty."""
+        if tier == 1:
+            if annotator not in self.data_scientists:
+                raise PermissionError(f"{annotator} is not a listed data scientist (tier 1)")
+            left = len(self.tier1_queue(annotator))
+        elif tier == 2:
+            if annotator not in self.cardiologists:
+                raise PermissionError(f"{annotator} is not a listed cardiologist (tier 2)")
+            left = len(self.tier2_queue(annotator))
+        else:
+            raise ValueError("tier is 1 or 2")
+        if left:
+            raise RuntimeError(f"{left} item(s) still in {annotator}'s tier-{tier} queue; finish them before signing off")
+        mine = self._answers_rows(tier)
+        n = int((mine.annotator == annotator).sum())
+        self.store.add_human(SIGNOFF_ITEM, f"signoff{tier}", json.dumps({"answers": n}), annotator, note)
+
+    def signoff_status(self) -> pd.DataFrame:
+        """Per reviewer: tier, answers given, signed off (after their last answer)."""
+        rows = []
+        for tier, people in ((1, self.data_scientists), (2, self.cardiologists)):
+            ans, so = self._answers_rows(tier), self._signoffs(tier)
+            for p in people:
+                a, s_ = ans[ans.annotator == p], so[so.annotator == p]
+                last = a._row.max() if len(a) else -1
+                rows.append({"tier": tier, "reviewer": p, "answers": len(a),
+                             "signed_off": bool(len(s_) and s_._row.max() > last)})
+        return pd.DataFrame(rows)
+
+    def tier1_signed_off(self) -> bool:
+        """Tier 1 complete for every item and signed off by every data scientist who answered."""
+        eff = self._t1_effective()
+        if any(not eff.get((i, t), (None, False))[1] for i, t in zip(self.items.item_id, self.items.task)):
+            return False
+        st = self.signoff_status()
+        st = st[(st.tier == 1) & (st.answers > 0)]
+        return bool(len(st)) and bool(st.signed_off.all())
+
+    def _require_tier1_signed_off(self) -> None:
+        if self.auto_tier1 == "assisted" and not self.tier1_signed_off():
+            raise RuntimeError("the cardiologist review opens after the data-scientist review is complete and "
+                               "every data scientist has signed off (audit.sign_off(<ds>, tier=1))")
+
+    def final_signed_off(self) -> bool:
+        """A listed cardiologist signed off after the last tier-2 answer."""
+        so = self._signoffs(2)
+        so = so[so.annotator.isin(self.cardiologists)]
+        ans = self._answers_rows(2)
+        return bool(len(so)) and so._row.max() > (ans._row.max() if len(ans) else -1)
+
+    def assist_report(self, min_cell: int = 11) -> pd.DataFrame:
+        """Assisted review (report 09f): per task group and tier, how often reviewers accepted,
+        rejected or were unsure about the automatic recommendation, by recommendation kind."""
+        rows = []
+        t1 = self._tier(1)
+        if "decision" in t1:
+            t1 = t1[t1.decision.notna()]
+            kinds = t1.value.map(lambda v: json.loads(v).get("kind"))
+            rows += [{"tier": 1, "group": tk.replace("phenotype:", ""), "kind": k, "decision": d}
+                     for tk, k, d in zip(t1.task, kinds, t1.decision)]
+        df = self.store.read()
+        a2 = df[df.task.str.startswith("assist2:", na=False) & (df.source == "human")]
+        a2 = a2.sort_values("ts", kind="stable").groupby(["item_id", "task", "annotator"]).tail(1)
+        rows += [{"tier": 2, "group": tk[len("assist2:"):].replace("phenotype:", ""),
+                  "kind": json.loads(v).get("kind"), "decision": json.loads(v).get("rec")}
+                 for tk, v in zip(a2.task, a2.value)]
+        cols = ["tier", "group", "kind", "items", "accept", "reject", "uncertain"]
+        if not rows:
+            return pd.DataFrame(columns=cols)
+        d = pd.DataFrame(rows)
+        out = (d.groupby(["tier", "group", "kind"]).decision.value_counts().unstack(fill_value=0)
+                 .reindex(columns=list(DECISIONS), fill_value=0).reset_index())
+        out["items"] = out[list(DECISIONS)].sum(1)
+        out = out[cols].astype(object)
+        for c in ("items", *DECISIONS):
+            v = pd.to_numeric(out[c], errors="coerce")
+            out.loc[(v > 0) & (v < min_cell), c] = f"<{min_cell}"
+        return out
 
     # ---- results
     def _auto(self, item_id, task):
@@ -342,7 +511,7 @@ class LabelAudit:
         t2 = self._tier(2)
         done = set(zip(t2.item_id, t2.task))
         st = self._t1_state()
-        st = st[[k in done for k in zip(st.item_id, st.task)]]
+        st = st[np.array([k in done for k in zip(st.item_id, st.task)], dtype=bool)]
         return pd.DataFrame({"item_id": st.item_id, "task": st.task,
                              "reason": st.outcome.replace({"accepted": "spot-check"})})
 
@@ -359,7 +528,7 @@ class LabelAudit:
         rows = []
         for (gname, by), g in f.groupby(["group", "tier1_by"]):
             keys = set(zip(g.item_id, g.task))
-            t1g = t1[[k in keys for k in zip(t1.item_id, t1.task)]]
+            t1g = t1[np.array([k in keys for k in zip(t1.item_id, t1.task)], dtype=bool)]
             n1 = len(t1g)
             agree1 = int((t1g.verdict == "agree").sum())
             adj = g[g.status == "cardiologist"]
@@ -431,9 +600,16 @@ class LabelAudit:
 
 
 # ------------------------------------------------------------------ using the audited labels
+def _require_final_signoff(audit: LabelAudit) -> None:
+    if audit.auto_tier1 == "assisted" and not audit.final_signed_off():
+        raise RuntimeError("the cardiologist has not signed off the adjudication (audit.sign_off(<cardiologist>, "
+                           "tier=2)); final labels are applied only after that sign-off")
+
+
 def apply_to_echo_store(audit: LabelAudit, echo_store: AnnotationStore, annotator: str = "audit") -> int:
     """Write every final echo label back into the echo store as a human label, so
     `annotate.echo finalize` uses the audited views and frames."""
+    _require_final_signoff(audit)
     f = audit.final_labels()
     f = f[(f.task == ECHO_TASK) & f.final_value.notna()]
     rows = []
@@ -453,6 +629,7 @@ def apply_to_labels(audit: LabelAudit, labels: pd.DataFrame) -> tuple[pd.DataFra
     """Replace automatic condition and outcome labels with the audited final labels for the women
     audited. Returns (new labels table, number of labels changed). Pending items are left as they
     were. A reviewed outcome sets its mask to 1. Risk tier is not recomputed (see RUNBOOK 4b)."""
+    _require_final_signoff(audit)
     f = audit.final_labels()
     f = f[f.task.str.startswith("phenotype:") & f.final_value.notna()]
     out = labels.copy()
